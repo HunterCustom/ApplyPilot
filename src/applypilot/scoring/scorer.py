@@ -128,7 +128,17 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
     else:
-        jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
+        # Load all candidates before limiting, so ranking applies globally.
+        # Without a user priority.yaml, preserve the original database ordering.
+        from applypilot.scoring.priority import load_priority_config, prioritize_jobs
+        priority_config = load_priority_config()
+        jobs = get_jobs_by_stage(
+            conn=conn, stage="pending_score", limit=0 if priority_config else limit
+        )
+        if priority_config:
+            jobs = prioritize_jobs(jobs, priority_config)
+            if limit > 0:
+                jobs = jobs[:limit]
 
     if not jobs:
         log.info("No unscored jobs with descriptions found.")
