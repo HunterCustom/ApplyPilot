@@ -7,6 +7,7 @@ profile and resume file.
 
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -71,14 +72,10 @@ def _parse_score_response(response: str) -> dict:
 
 
 def score_job(resume_text: str, job: dict) -> dict:
-    """Score a single job against the resume.
+    """Score one job, retrying empty, malformed and failed LLM responses.
 
-    Args:
-        resume_text: The candidate's full resume text.
-        job: Job dict with keys: title, site, location, full_description.
-
-    Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+    An unsuccessful evaluation returns score=0 as an internal error marker;
+    run_scoring never persists that marker to the jobs table.
     """
     job_text = (
         f"TITLE: {job['title']}\n"
@@ -86,30 +83,41 @@ def score_job(resume_text: str, job: dict) -> dict:
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
-
     messages = [
         {"role": "system", "content": SCORE_PROMPT},
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
-    try:
-        client = get_client()
-        response = client.chat(messages, max_tokens=2048, temperature=0.2)
-        return _parse_score_response(response)
-    except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+    max_tokens = max(256, int(os.environ.get("APPLYPILOT_SCORE_MAX_TOKENS", "2048")))
+    max_attempts = max(1, int(os.environ.get("APPLYPILOT_SCORE_ATTEMPTS", "3")))
+    last_error = "Unknown scoring failure"
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = get_client().chat(messages, max_tokens=max_tokens, temperature=0.2)
+            if not response or not response.strip():
+                raise ValueError("Empty LLM response")
+            if not re.search(r"(?im)^\s*SCORE:\s*(?:10|[1-9])\s*$", response):
+                raise ValueError("Missing or invalid SCORE field")
+            if not re.search(r"(?im)^\s*REASONING:\s*\S", response):
+                raise ValueError("Missing REASONING field")
+            parsed = _parse_score_response(response)
+            return parsed
+        except Exception as exc:
+            last_error = str(exc)
+            log.warning(
+                "Scoring attempt %d/%d failed for '%s': %s",
+                attempt, max_attempts, job.get("title", "?"), last_error,
+            )
+    log.error("All scoring attempts failed for '%s'", job.get("title", "?"))
+    return {"score": 0, "keywords": "", "reasoning": f"LLM error: {last_error}"}
+
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
-    """Score unscored jobs that have full descriptions.
+    """Score jobs, committing each successful evaluation immediately.
 
-    Args:
-        limit: Maximum number of jobs to score in this run.
-        rescore: If True, re-score all jobs (not just unscored ones).
-
-    Returns:
-        {"scored": int, "errors": int, "elapsed": float, "distribution": list}
+    Failed evaluations remain unscored and are eligible for subsequent runs.
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
@@ -126,55 +134,38 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         log.info("No unscored jobs with descriptions found.")
         return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
 
-    # Convert sqlite3.Row to dicts if needed
     if jobs and not isinstance(jobs[0], dict):
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
     log.info("Scoring %d jobs sequentially...", len(jobs))
     t0 = time.time()
-    completed = 0
+    scored = 0
     errors = 0
-    results: list[dict] = []
 
-    for job in jobs:
+    for index, job in enumerate(jobs, start=1):
         result = score_job(resume_text, job)
-        result["url"] = job["url"]
-        completed += 1
-
         if result["score"] == 0:
             errors += 1
+            log.warning("[%d/%d] not saved (retryable): %s", index, len(jobs), job.get("title", "?"))
+            continue
 
-        results.append(result)
-
-        log.info(
-            "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
-        )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
+        now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, job["url"]),
         )
-    conn.commit()
+        conn.commit()
+        scored += 1
+        log.info("[%d/%d] score=%d saved: %s", index, len(jobs), result["score"], job.get("title", "?")[:60])
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
-
-    # Score distribution
+    log.info("Done: %d saved, %d errors in %.1fs", scored, errors, elapsed)
     dist = conn.execute("""
         SELECT fit_score, COUNT(*) FROM jobs
         WHERE fit_score IS NOT NULL
         GROUP BY fit_score ORDER BY fit_score DESC
     """).fetchall()
     distribution = [(row[0], row[1]) for row in dist]
+    return {"scored": scored, "errors": errors, "elapsed": elapsed, "distribution": distribution}
 
-    return {
-        "scored": len(results),
-        "errors": errors,
-        "elapsed": elapsed,
-        "distribution": distribution,
-    }
