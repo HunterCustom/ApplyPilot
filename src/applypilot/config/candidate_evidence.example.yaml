@@ -1,0 +1,18 @@
+# Copy to your *local* APPLYPILOT_DIR/candidate_evidence.yaml.
+# Review and replace every example with verified facts before enabling.
+# Never commit your filled-in personal profile or resume.
+enabled: false
+
+# Only accomplishments from paid employment, contracts, or internships.
+# Include employer/role, scope, tools, and dates where known.
+professional_experience:
+  - "EXAMPLE ONLY: Repaired enterprise laptops using documented service procedures."
+
+# List only certifications actually earned; include expiration if relevant.
+certifications:
+  - "EXAMPLE ONLY: Vendor certification (earned YYYY)."
+
+# Hobbies/homelab/side projects belong here, NOT under professional employment.
+# Avoid claiming industry credentials from unrelated hands-on work.
+personal_projects:
+  - "EXAMPLE ONLY: Built a home networking lab with segmented VLANs."
