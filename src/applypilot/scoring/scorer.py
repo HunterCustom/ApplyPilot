@@ -15,13 +15,14 @@ from datetime import datetime, timezone
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.candidate_evidence import load_candidate_evidence, format_candidate_evidence
 
 log = logging.getLogger(__name__)
 
 
 # â”€â”€ Scoring Prompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume, optional user-verified evidence, and job description, score how well the candidate fits the role.
 
 SCORING CRITERIA:
 - 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
@@ -35,6 +36,11 @@ IMPORTANT FACTORS:
 - Consider transferable experience (automation, scripting, API work)
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
+- Only credit claims explicitly supported by the resume or verified evidence; never invent credentials, employers, or years.
+- Distinguish professional work from personal projects. Personal projects show transferable skills but do not establish years of paid experience.
+- Identify core requirements vs preferred qualifications. Do not assume every preference is mandatory.
+- In REASONING briefly identify demonstrated skills, meaningful gaps, and any mandatory requirement that needs verification.
+- Job location and remote eligibility must be independently verified; do not equate remote with eligibility.
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
@@ -71,7 +77,7 @@ def _parse_score_response(response: str) -> dict:
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
-def score_job(resume_text: str, job: dict) -> dict:
+def score_job(resume_text: str, job: dict, evidence_text: str = "") -> dict:
     """Score one job, retrying empty, malformed and failed LLM responses.
 
     An unsuccessful evaluation returns score=0 as an internal error marker;
@@ -83,9 +89,10 @@ def score_job(resume_text: str, job: dict) -> dict:
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
+    extra_evidence = f"\n\nADDITIONAL USER-VERIFIED EVIDENCE:\n{evidence_text}" if evidence_text else ""
     messages = [
         {"role": "system", "content": SCORE_PROMPT},
-        {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
+        {"role": "user", "content": f"RESUME:\n{resume_text}{extra_evidence}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
     max_tokens = max(256, int(os.environ.get("APPLYPILOT_SCORE_MAX_TOKENS", "2048")))
@@ -120,6 +127,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     Failed evaluations remain unscored and are eligible for subsequent runs.
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    evidence_text = format_candidate_evidence(load_candidate_evidence())
     conn = get_connection()
 
     if rescore:
@@ -154,7 +162,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     errors = 0
 
     for index, job in enumerate(jobs, start=1):
-        result = score_job(resume_text, job)
+        result = score_job(resume_text, job, evidence_text)
         if result["score"] == 0:
             errors += 1
             log.warning("[%d/%d] not saved (retryable): %s", index, len(jobs), job.get("title", "?"))
