@@ -195,9 +195,14 @@ class LLMClient:
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
         # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
-            first = messages[0]
-            if first.get("role") == "user" and not first["content"].startswith("/no_think"):
-                messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+            # Scoring starts with a system prompt; prefix the first user message,
+            # without mutating the caller's messages.
+            messages = [dict(message) for message in messages]
+            for message in messages:
+                if message.get("role") == "user" and isinstance(message.get("content"), str):
+                    if not message["content"].startswith("/no_think"):
+                        message["content"] = "/no_think\n" + message["content"]
+                    break
 
         for attempt in range(_MAX_RETRIES):
             try:
