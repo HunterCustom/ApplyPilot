@@ -16,7 +16,7 @@ class QwenPromptTests(unittest.TestCase):
         client.chat(messages)
         sent = client._chat_compat.call_args.args[0]
         self.assertEqual(sent[0]["content"], "Be concise.")
-        self.assertTrue(sent[1]["content"].startswith("/no_think\\n"))
+        self.assertTrue(sent[1]["content"].startswith("/no_think\n"))
         self.assertEqual(messages[1]["content"], "Score this job.")
         client.close()
 
