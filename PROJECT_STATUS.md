@@ -1,90 +1,128 @@
 # Project Status
 
-_Audit date: 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81c13b8` · Fork is level with `upstream/main` (4a8d521) plus fork commits._
+_Updated 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81c13b8` · Fork is level with
+`upstream/main` (4a8d521) plus fork commits. See `DEVELOPMENT_ROADMAP.md` for next steps and
+`APPLY_AGENT_SECURITY_PLAN.md` for the apply-agent hardening plan._
 
-## Phase 0 result (2026-11-27) — DONE, verified by tests
-| Item | Status |
+## Current state
+| Area | State |
 |---|---|
-| Dry run never records `applied` / `applied_at`; launcher enforces even if agent says APPLIED | Fixed (`021d9a4`) |
-| Dry run status `dry_run`, no retry attempts consumed, job re-eligible for real runs | Fixed |
-| `apply --url` with NULL status; applied / in_progress / needs_review never acquired | Fixed |
-| Duplicate guard on shared `application_url` | Added (URL-level only; company/title dedupe is Phase 3) |
-| Concurrent acquisition (8 threads, 6 jobs → 6 unique claims) | Verified |
-| Manual-ATS skip continues to next job | Fixed |
-| Uncertain outcomes (no/conflicting RESULT, timeout, watchdog, Ctrl+C after agent start, launcher error) → `needs_review`, not retried; `--reset-failed` leaves them alone | Added |
-| Stale `in_progress` locks recovered at `apply` start (dry → released, real → needs_review) | Added |
-| Hung agent watchdog (`APPLYPILOT_APPLY_MAX_SECONDS`, default 1200 s) | Added |
-| `status` shows dry-run and needs-review counts | Added |
-| Dev `.env` duplicate `LLM_MODEL` | Resolved (backup `.env.backup-20261127-132213` in dev dir) |
-| Effective LLM: Local `http://127.0.0.1:1234/v1`, model `qwen/qwen3-14b` (confirmed in `/v1/models`, test inference returned `OK` in 8.2 s) | Verified |
-| `doctor` reports effective provider/model, checks model is served, warns on ignored keys | Fixed (`b811031`) |
-| Tests | 35/35 pass (22 apply-safety + 4 provider + 9 existing); new test files lint-clean; no new ruff findings in modified source files |
+| Discovery / enrichment | Working (one run, 896 jobs, 43 enrichment errors). Discovery targets are mostly irrelevant upstream employers. |
+| LLM | Local LM Studio `qwen/qwen3-14b` at `http://127.0.0.1:1234/v1`; verified inference; `doctor` reports it accurately. |
+| Scoring | Working; evidence profile + NC priority ordering. Ineligible jobs are now skipped before the LLM. |
+| Geographic eligibility | **New**, deterministic, v1.0.0. Gates tailoring and applying (queue and `--url`). |
+| Tailoring / cover / PDF | Never run on this data. 11 high-scoring jobs are now eligible to tailor. |
+| Apply | Safety-hardened but **not yet run**. Browser tests blocked on `APPLY_AGENT_SECURITY_PLAN.md` S1–S4. |
+| Tests | 96 pass (+18 subtests): apply safety, eligibility, LLM provider, scoring. |
 
-Resolving a `needs_review` job: check the employer portal / email, then `applypilot apply --mark-applied URL`
-or `--mark-failed URL` (then `--reset-failed` to requeue).
+## Safety model (apply)
+- **Statuses**: NULL/`failed` (retryable), `dry_run`, `in_progress`, `applied`, `needs_review`, `manual`.
+  Lifecycle documented at the top of the DB section in `apply/launcher.py`.
+- **Outcome**: read only from the agent's final stream-json `result` event; only standalone `RESULT:` lines
+  count. Missing / malformed / conflicting results, agent errors, watchdog kills, interruptions after the
+  agent started, and any non-APPLIED result after a submit-like action → `needs_review` (never auto-retried).
+- **Ownership**: claims carry `<session>:worker-N[:dry_run]`; results and releases only apply to the
+  caller's own in-progress claim, so late results never overwrite another worker, a stale-lock recovery
+  or a manual decision. Stale locks are recovered at start (dry → released, real → needs_review), never
+  the current process's own claims.
+- **Dry runs**: never recorded as applied (launcher-enforced). Email sending disabled via
+  `--disallowedTools` (enforced by Claude Code). A PreToolUse hook (`apply/dry_run_guard.py`) blocks
+  submit-like clicks, Enter, `submit=true` typing and click/submit scripts — **verified live** that hooks
+  block under `bypassPermissions`. A submit-like action the guard did not block → `needs_review`.
+  **Limitation:** the guard judges the tool input's description; a button that submits but is labelled
+  e.g. "Continue" cannot be recognised. Dry runs are therefore *not* submission-proof and must be supervised.
+- **CAPTCHA**: solving/CapSolver removed everywhere. Agent detects CAPTCHA / access restrictions, outputs
+  `RESULT:CAPTCHA` and stops; the worker moves on.
+- **Chrome**: only processes whose command line shows the ApplyPilot worker profile are ever killed; a
+  foreign listener on the CDP port makes launch refuse. No import-time exit hooks.
+- **Agent isolation**: `--strict-mcp-config` (user's MCP servers excluded). Still `bypassPermissions` with
+  built-in tools available — see security plan S1.
 
-_The audit findings below are kept as the original baseline; items 1, 2, 4, 5 are resolved by Phase 0._
+Resolving `needs_review`: check the portal/email, then `applypilot apply --mark-applied URL` or
+`--mark-failed URL` (then `--reset-failed` to requeue).
 
-## Dev data snapshot (`~/.applypilot-dev`, read-only inspection)
-| Metric | Value |
-|---|---|
-| Jobs discovered | 896 (one discovery run, 2026-11-23) |
-| With full description | 853 (43 enrichment errors) |
-| Scored | 853 — distribution 8:11, 7:9, 6:54, 5:66, 4:44, 3:109, 2:292, 1:268 |
-| Score ≥ 7 (apply candidates) | 20 — 13 NC, 4 "Remote, USA", 3 state-specific remote / unknown |
-| Tailored / cover letters / applied | 0 / 0 / 0 |
-| Scored jobs with no location | 472 (Thomson Reuters 312, Moderna 165 — Workday employers) |
+## Eligibility engine (`src/applypilot/eligibility.py`)
+- Classes: `eligible_nc`, `eligible_us_remote`, `restricted_remote`, `ineligible`, `unknown`,
+  plus human `eligible_manual` / `ineligible_manual` (never overwritten).
+- Evidence: location field (multi-location, truncation), title-embedded locations, Workday URL slug and
+  `Location:` lines when the field is empty, description residency / state-list / exclusion /
+  nationwide-remote / onsite patterns. Stored: status, reason, JSON evidence, tier, version, timestamp.
+- Precedence: NC exclusion > residency list without NC > NC commute tier > remote (nationwide needs
+  positive US evidence) > other NC (config, default review) > out-of-state onsite > foreign > unknown.
+- Config: `searches.yaml` → `eligibility:` (dev data has the Burlington/Graham/Mebane/Whitsett >
+  Greensboro > High Point/Durham/Raleigh tiers); legacy `location_accept` still honoured.
+- Pipeline: score stage classifies first and skips ineligible; tailor and apply require eligible from the
+  current classifier version (or manual approval). Apply queue order: commute tier, then fit score.
+- CLI: `applypilot eligibility` (review queue, `--status`, `--evidence`, `--reclassify`,
+  `--approve/--reject URL --note`); `applypilot status` shows counts.
 
-Source mix is dominated by upstream's default `employers.yaml` (Thomson Reuters, Moderna, several Canadian banks), which is mostly noise for NC IT roles.
+## Evaluation on a copy of the dev DB (original verified unchanged by SHA-256)
+| Classification | All 896 | Scored 853 |
+|---|---|---|
+| ineligible | 613 | 613 |
+| eligible_us_remote | 90 | 90 |
+| eligible_nc | 60 | 60 |
+| unknown (review) | 45 | 45 |
+| restricted_remote (review) | 45 | 45 |
+| unclassified (no description, enrichment errors) | 43 | 0 |
 
-## Verified working
-- `doctor`: profile, resume, searches, Claude Code CLI, Chrome, Node/npx present → Tier 3 (full auto-apply) unlocked. JobSpy shows WARN in doctor but discovery produced 116 Indeed jobs.
-- Local LLM server (LM Studio) reachable; qwen3-14b loaded. Qwen `/no_think` injection covered by tests.
-- Scoring: retries malformed/empty responses, never persists failures, prompt forbids crediting unsupported claims and treats remote ≠ eligible.
-- Candidate evidence: validated YAML (enabled, 4 professional / 15 certs / 6 personal projects), bounded and labelled in prompt.
-- Priority ordering: NC titles/locations ranked first before `--limit`; ordering only, nothing filtered.
-- Apply infrastructure exists upstream: atomic job acquisition, per-worker Chrome + Playwright MCP, `RESULT:` parsing, permanent-failure classification, blocked sites, manual-ATS skip, `--dry-run`, dashboard, `--mark-applied/--mark-failed/--reset-failed` utilities.
-- Tailoring/cover validator exists (banned words, fabrication watchlist, strict/normal/lenient).
-- Playwright Chromium installed (needed for PDF stage).
-- Tests: 9/9 pass (pytest and unittest).
+- 613 LLM scoring calls (72% of the previous run) would have been avoided.
+- Ineligible reasons: 273 out-of-state onsite, 191 outside US, 98 foreign remote, 13 residency
+  requirements without NC, ~30 state-limited remote.
+- Missing location (485 rows): 470 recovered from Workday URL slugs, 15 without evidence. Of 472 scored:
+  463 ineligible (mostly MA/MN/NY/TX offices and non-US), 7 eligible_us_remote (description says remote
+  within the US), 2 unknown.
 
-## Broken / missing (ranked by impact)
-1. **CRITICAL — dry-run records jobs as applied.** `apply/prompt.py:512` tells the agent to output `RESULT:APPLIED` in dry-run; `launcher.worker_loop` then calls `mark_result(..., "applied")`. A dry run would permanently remove jobs from the queue and corrupt duplicate tracking. Must fix before any apply testing.
-2. **Targeted apply is broken and unsafe.** `acquire_job(target_url=...)` uses `apply_status != 'in_progress'`, which is false for NULL (never-attempted jobs never match) and true for `applied` (re-application allowed).
-3. **No hard eligibility gate.** Priority only reorders. Apply prompt says `"Remote" → ELIGIBLE`, ignoring state-restricted remote roles (e.g. "Colorado Remote Work, More…"). Apply prompt reads `searches.location.accept_patterns`, but the config uses `location_accept` → only the profile city is treated as acceptable for onsite/hybrid (other NC cities rejected by the agent).
-4. **LLM config ambiguous.** Dev `.env` defines `LLM_MODEL` twice; effective config sends model name `gemini-3.5-flash-lite` to the local LM Studio endpoint. `doctor` mislabels it as Gemini. Which model produced the existing scores is unrecorded.
-5. **Manual-ATS skip ends the run.** `acquire_job` returns `None` after marking a manual ATS, which the worker treats as "queue empty".
-6. **No liveness re-check before apply.** Enrichment runs once; expiry is only discovered by the browser agent mid-application (costly). Scores are already 4 days old.
-7. **Duplicate prevention is URL-only.** Same role from Indeed and the employer's Workday = two rows (46 title+location duplicate groups; 2 duplicate application_urls). No company-normalised dedupe, no "applied to this company/role recently" guard.
-8. **Tailoring never run.** Validator's skill boundary uses `profile.skills_boundary` where `programming_languages`/`frameworks` are empty — behaviour unverified for this profile.
-9. **Credential exposure in logs.** Apply prompt includes profile password for account creation; full agent output is written to `logs/claude_*.txt`. Keep logs out of git (already ignored) and consider redacting.
-10. **Lint:** `ruff check src/` fails with 147 findings (pre-existing upstream; 9 in fork-modified scoring files) → CI is red. Mojibake in a comment banner in `scorer.py:23`.
-11. **Discovery targeting:** default employers list is irrelevant to NC; 472 scored jobs have no location, so the eligibility of 54% of the corpus is unknown.
+### The 20 jobs scoring ≥ 7
+| Score | Title | Employer | Location | Eligibility | Reason |
+|---|---|---|---|---|---|
+| 8 | Technical Services Technician II | indeed | Greensboro, NC | eligible_nc (high) | NC commute tier |
+| 8 | Business Technician, Level 2 | indeed | Raleigh, NC | eligible_nc (acceptable) | NC commute tier |
+| 8 | IT Network Engineer | indeed | Raleigh, NC | eligible_nc (acceptable) | NC commute tier |
+| 8 | IT Support Specialist | indeed | Remote, USA | eligible_us_remote | nationwide US remote |
+| 8 | Customer Support Engineer | indeed | Remote, USA | eligible_us_remote | nationwide US remote |
+| 8 | Field Service Engineer - US Remote | Motorola | Colorado Remote Work, More… | eligible_us_remote | title says "US Remote" |
+| 8 | Advisory Technical Support Engineer | indeed | Morrisville, NC | unknown | NC outside commute tiers |
+| 8 | IT Infrastructure & Network Specialist (Onsite) | indeed | Timberlake, NC | unknown | NC outside commute tiers |
+| 8 | Technology Support Specialist | indeed | Chapel Hill, NC | unknown | NC outside commute tiers |
+| 8 | Customer Support Technician I | Motorola | Utah Remote Work, More… | restricted_remote | state list truncated, NC unconfirmed |
+| 8 | Engineer, IT Lab Support | Moderna | (none → Workday: Norwood, MA) | ineligible | MA, "100% onsite" |
+| 7 | Product Support Specialist Tech 1 | indeed | Greensboro, NC | eligible_nc (high) | NC commute tier |
+| 7 | IT Support Manager | indeed | High Point, NC | eligible_nc (acceptable) | NC commute tier |
+| 7 | Service Desk Analyst II | indeed | Remote, USA | eligible_us_remote | nationwide US remote |
+| 7 | Service Desk Engineer II (The Woodlands, TX or Remote) | indeed | Remote, USA | eligible_us_remote | remote option |
+| 7 | Services Project Manager | Ciena | Remote-US | eligible_us_remote | nationwide US remote |
+| 7 | Desktop Support Analyst I | indeed | Clayton, NC | unknown | NC outside commute tiers |
+| 7 | IT Help Desk Technician | indeed | Trinity, NC | unknown | NC outside commute tiers |
+| 7 | Network Administrator | indeed | Lillington, NC | unknown | NC outside commute tiers |
+| 7 | System Technologist | Motorola | Utah Remote Work, More… | restricted_remote | state list truncated |
 
-## Tooling available
-- Claude Code 2.1.332 (also the apply agent), Node 24 / npx (Playwright MCP), Chrome, uv, ripgrep, git. `gh` not installed.
-- MCP: context-mode (`ctx_execute`/`ctx_search` for large outputs), RTK output condensing, Serena ×3 + graphify ×3 (all bound to unrelated projects), Claude in Chrome / built-in browser (for manual verification only).
-- `.serena/` — local Serena cache + Codex-era memories with machine paths → now gitignored.
+Totals: 5 eligible_nc + 6 eligible_us_remote ready to tailor; 6 NC-commute reviews; 2 restricted; 1 ineligible.
 
-### Dedicated Serena for ApplyPilot (investigated, not yet enabled)
-Existing user-scope servers (`serena-victory`, `serena-xcl`, `serena-fxceless`, `graphify-*`) are pinned to
-`F:\` projects and must stay untouched. ApplyPilot is already registered in `~/.serena/serena_config.yml`
-and has `.serena/project.yml`. Add a **project-scoped** server in `ApplyPilot-Dev/.mcp.json`
-(already gitignored by `.mcp*.json`); Claude Code asks for approval on next start:
-```json
-{"mcpServers": {"serena-applypilot": {
-  "command": "C:\\Users\\Hunter\\.local\\bin\\serena.exe",
-  "args": ["start-mcp-server", "--project", "C:\\Users\\Hunter\\ApplyPilot-Dev", "--context", "claude-code",
-           "--agent-interface", "tools", "--transport", "stdio", "--open-web-dashboard", "false"]}}}
-```
-Graphify: optional, low value for a ~10k-line repo. It would need a graph built into `graphify-out/`
-(via the graphify skill), then `graphify-mcp.exe --graph <repo>\graphify-out\graph.json` in the same `.mcp.json`;
-`graphify-out/` would need gitignoring.
+### False-positive / false-negative risks
+- **FP:** Indeed's "Remote, USA" label is trusted when the description has no state list; 30/90 remote-
+  eligible descriptions mention onsite/hybrid wording that was judged benign (e.g. "onsite support",
+  "hybrid cloud"), and "strong preference for candidates in VA/MD/DC" is a preference, not a requirement.
+  Title "US Remote" overrides a truncated state list (Motorola).
+- **FN:** Workday slugs give only the primary location — multi-site postings with an NC site may be
+  marked ineligible. Residency patterns are English-phrase based; unusual wording is missed (→ the job
+  keeps its location-based class). Unlisted NC towns default to review, not eligible.
+- Mitigations: review queue, `--evidence`, manual approve/reject, and the apply agent re-checks the
+  live posting and stops on contradictions (`RESULT:FAILED:not_eligible_location` / `location_unclear`).
 
-## Remaining safety risks (post Phase 0)
-- **No hard eligibility gate** (Phase 2): the apply prompt still treats any "Remote" as eligible and ignores `location_accept`.
-- **CAPTCHA wording in apply prompt**: the prompt tells the agent to "solve" CAPTCHAs and includes a CapSolver path when `CAPSOLVER_API_KEY` is set (it is not set). This conflicts with the no-bypass constraint; must be changed to detect-and-stop before any browser test (Phase 5 prerequisite).
-- Agent runs with `--permission-mode bypassPermissions` and a Gmail MCP (read access to the mailbox for verification codes); destructive Gmail tools are disallowed.
-- Profile password in the apply prompt and full agent transcripts written to `logs/`.
-- Duplicate detection is URL-based only; the same role under different URLs can still be applied to twice (Phase 3).
-- `needs_review` resolution is manual and there is no dedicated CLI listing yet (`status` shows the count).
+## Dev environment
+- `~/.applypilot-dev`: `.env` (backup `.env.backup-20261127-132213`), `searches.yaml`
+  (backup `searches.yaml.backup-20261127-134858`, `eligibility:` section added). Production
+  `~/.applypilot` untouched.
+- MCP: project-scoped `serena-applypilot` in `.mcp.json` (gitignored); Claude Code shows it *pending
+  approval* — restart Claude Code in this repo and approve it. User-scope VIctory/xcl/fxceless servers untouched.
+- Tooling: Claude Code 2.1.332, Node 24, Chrome, uv, ripgrep, git; `gh` not installed. context-mode/RTK
+  condense output (use `ctx_execute` for large data, `Read` with offset/limit for source).
+
+## Known remaining issues
+- Apply-agent exposures E1–E7 (`APPLY_AGENT_SECURITY_PLAN.md`), notably full built-in tools under
+  bypassPermissions and the cloned real Chrome profile.
+- No pre-apply liveness check; scores/descriptions are from 2026-11-23.
+- Duplicate detection is application-URL only (same role under different URLs not caught).
+- No `needs_review` listing command yet (`status` shows the count).
+- Repo-wide ruff has ~147 pre-existing upstream findings (CI red); touched files add none.
