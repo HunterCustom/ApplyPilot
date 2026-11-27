@@ -1,8 +1,23 @@
 # Apply Agent Security Plan
 
-_Status: plan only (2026-11-27). Nothing here is enabled yet. No browser-based application runs until
-items S1–S4 are done. CLI capabilities below were checked against the installed Claude Code and
-`@playwright/mcp` `--help` output._
+_Status (2026-11-27, `fcf9e31`): **S1–S4 implemented**, S5 prompt change done, S6 not started.
+Verified by unit tests (`tests/test_apply_security.py`, synthetic only) and a live probe on local
+synthetic pages (`scripts/live_policy_probe.py`). No apply run (dry or real) has happened yet. Next
+security task: launcher-owned CDP network controller (roadmap Phase 3b)._
+
+## Implementation notes / deviations from the plan
+- **S1** as planned, plus `--setting-sources ""` (no user plugins/hooks/skills reach the agent) and
+  runtime verification of the stream-json init event; the launcher refuses to run if the CLI lacks the
+  flags. `--bare` was rejected: it would also skip our own `--settings` hooks.
+- **S2**: Playwright `--allowed-origins` was **not** used — a network-level origin allowlist would also
+  block CDN/font/script subresources that real ATS pages need. Instead: PreToolUse URL checks +
+  PostToolUse page-URL tripwire + session halt. Gap: a redirect's request reaches the target before
+  the tripwire fires (measured: internal test server got the GET). Planned fix: CDP `Fetch` controller.
+- **S3**: implemented as a local stdio MCP server (`apply/verification_mcp.py`), not yet exercised
+  against real Gmail (no credentials configured). Token scope must be exactly `gmail.readonly`.
+- **S4**: option (a) chosen — account creation/login is manual (`needs_review human:account_required`).
+- **Task E**: per-submit human approval through the hook (`apply --approve`), `--allow-real-submissions`
+  required for any real run, APPLIED requires approval + confirmation evidence.
 
 ## Current exposure (verified in code)
 | # | Exposure | Where |
@@ -15,7 +30,10 @@ items S1–S4 are done. CLI capabilities below were checked against the installe
 | E6 | Prompt says "You are autonomous… Do whatever it takes", which invites following page instructions. | `prompt.build_prompt` (YOUR MISSION) |
 | E7 | Screening questions are answered by the agent from general rules; no hard stop for sensitive or unsupported questions. | `prompt._build_screening_section` |
 
-Already mitigated: dry-run guard hook + email disabled in dry runs, `--strict-mcp-config`, CAPTCHA
+Status of E1–E7: E1 fixed (S1), E2 fixed (S3), E3 fixed (pinned), E4 fixed (S4; profile contact
+data still in the prompt by necessity, redacted from logs), E5 fixed, E6 fixed (S5), E7 open (S6).
+
+Previously mitigated: dry-run guard hook + email disabled in dry runs, `--strict-mcp-config`, CAPTCHA
 detect-and-stop, standalone-result parsing, uncertain → `needs_review`.
 
 ## Plan (in order)

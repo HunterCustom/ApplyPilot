@@ -20,15 +20,34 @@ Each phase ends with tests passing and a review checkpoint. Estimates are focuse
   `applypilot eligibility --approve/--reject URL`.
 - Skim `applypilot eligibility --status eligible_us_remote --evidence --min-score 7`.
 
-## Phase 3 — Apply-agent security S1–S4 (≈2 sessions) ← NEXT (dev)
-See `APPLY_AGENT_SECURITY_PLAN.md`: least-privilege tools (`--tools ""`, `dontAsk` + allow-list), hook
-browsing policy + `--allowed-origins`, narrow verification-code helper instead of Gmail MCP, no
-password in prompts, redacted logs, stop cloning the real Chrome profile, pinned MCP versions.
+## Phase 3 — Apply-agent security S1–S4 — DONE (`fcf9e31`)
+Restricted tool surface with runtime verification, policy hooks (navigation/upload/value, redirect
+tripwire, real-run submit approval), no Gmail MCP (optional readonly verification helper), no password
+in prompts, empty isolated Chrome profiles, redacted logs, lifecycle/concurrency fixes. Live probe on
+local synthetic pages. Details: `PROJECT_STATUS.md` § Safety model.
+
+## Phase 3b — Launcher-owned network controller (≈1 session) ← NEXT (dev, security)
+- Launcher attaches its own CDP session (Playwright `connect_over_cdp` / raw `Fetch.enable` with
+  auto-attach to new targets) and fails, *before they are sent*: every request (incl. redirect hops,
+  subframes, popups) to localhost / private / link-local / non-http(s) targets; top-level navigations
+  off the session allowlist; and, in dry runs, every non-GET request to the application origins
+  (independent, label-free dry-run boundary). WebSocket/beacon gaps documented and tested.
+- Verify with `scripts/live_policy_probe.py redirect` (target must receive **zero** hits) and a
+  synthetic form whose "Continue" button POSTs (must be blocked in dry runs).
 
 ## Phase 4 — Tailoring + cover letters on real data (≈0.5–1 session)
-- `applypilot run tailor cover pdf --min-score 7` on the 11 eligible high scorers with the local model.
-- Human review of outputs against resume + evidence; fill `profile.skills_boundary`; validator `strict`.
-- Test that tailored output contains no skill outside resume ∪ evidence; record model name with scores.
+Prerequisites (code, before any bulk generation):
+- Judge-rejected resumes must not count as success (`tailor.py` accepts `approved_with_judge_warning`
+  and sets `tailored_resume_path`); route them to human review instead. Same for cover letters, which
+  have no judge and return the last attempt even when validation failed (`cover_letter.py:183`).
+- Deterministic claim check: every skill/tool/cert/metric in the output must appear in the base resume,
+  `profile.skills_boundary`/`resume_facts`, or user-verified `candidate_evidence.yaml` (today the
+  validator uses `skills_boundary` only and tailoring never reads the evidence file).
+- Freshness: store `date_posted` (jobspy provides it) and re-check the posting (HTTP fetch, closed
+  phrases, still eligible) right before tailoring; skip postings older than N days (configurable).
+- Run eligibility on the real dev DB (it has no eligibility columns yet; the 11 came from a copy).
+Then: `applypilot run tailor cover pdf --min-score 7` one job at a time with human review of each output
+against resume + evidence; validator `strict`; record model name with outputs.
 
 ## Phase 5 — Liveness + dedupe (≈1 session)
 - Pre-apply liveness check (HTTP status + closed-posting phrases) → `expired` without an agent run.
@@ -36,7 +55,7 @@ password in prompts, redacted logs, stop cloning the real Chrome profile, pinned
 - `applypilot apply --review` listing `needs_review` jobs with reason and log path.
 
 ## Phase 6 — Supervised dry-run applications (≈1 session)
-- S5/S6 prompt changes (injection resistance, stop-and-ask screening questions).
+- S5 done (trust-boundary prompt). S6 stop-and-ask screening questions still to do.
 - `apply --dry-run --url` on 3–5 jobs across ATS types, visible Chrome, watching every step.
 
 ## Phase 7 — Supervised real submissions (user-run), then autonomy
@@ -44,5 +63,5 @@ password in prompts, redacted logs, stop cloning the real Chrome profile, pinned
 - NC employer list for discovery; scheduled discover→enrich→score→tailor; daily review digest.
 - Ruff cleanup in touched files so CI can go green.
 
-**Estimate to supervised real submission (end of Phase 6): ~4.5–5 working sessions** (security plan
-added ~2 sessions that were previously implicit).
+**Estimate to supervised real submission (end of Phase 6): ~3.5–4 working sessions** (Phase 3b,
+4, 5, 6).

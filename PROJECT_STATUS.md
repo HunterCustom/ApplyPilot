@@ -11,32 +11,43 @@ _Updated 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81
 | LLM | Local LM Studio `qwen/qwen3-14b` at `http://127.0.0.1:1234/v1`; verified inference; `doctor` reports it accurately. |
 | Scoring | Working; evidence profile + NC priority ordering. Ineligible jobs are now skipped before the LLM. |
 | Geographic eligibility | **New**, deterministic, v1.0.0. Gates tailoring and applying (queue and `--url`). |
-| Tailoring / cover / PDF | Never run on this data. 11 high-scoring jobs are now eligible to tailor. |
-| Apply | Safety-hardened but **not yet run**. Browser tests blocked on `APPLY_AGENT_SECURITY_PLAN.md` S1–S4. |
-| Tests | 96 pass (+18 subtests): apply safety, eligibility, LLM provider, scoring. |
+| Tailoring / cover / PDF | Never run on this data. 11 eligible high scorers (on the evaluation copy). **Blocked on Phase 4 prerequisites** (judge-rejected output is accepted; no freshness check) — see roadmap. |
+| Apply | S1–S4 implemented (`fcf9e31`) and verified with unit tests + a live probe on local synthetic pages. **No apply run yet** (dry or real); next: supervised dry runs (security plan exit criteria). |
+| Tests | 142 pass (+18 subtests): apply safety + security boundaries, eligibility, LLM provider, scoring. |
 
 ## Safety model (apply)
 - **Statuses**: NULL/`failed` (retryable), `dry_run`, `in_progress`, `applied`, `needs_review`, `manual`.
   Lifecycle documented at the top of the DB section in `apply/launcher.py`.
 - **Outcome**: read only from the agent's final stream-json `result` event; only standalone `RESULT:` lines
   count. Missing / malformed / conflicting results, agent errors, watchdog kills, interruptions after the
-  agent started, and any non-APPLIED result after a submit-like action → `needs_review` (never auto-retried).
-- **Ownership**: claims carry `<session>:worker-N[:dry_run]`; results and releases only apply to the
-  caller's own in-progress claim, so late results never overwrite another worker, a stale-lock recovery
-  or a manual decision. Stale locks are recovered at start (dry → released, real → needs_review), never
-  the current process's own claims.
-- **Dry runs**: never recorded as applied (launcher-enforced). Email sending disabled via
-  `--disallowedTools` (enforced by Claude Code). A PreToolUse hook (`apply/dry_run_guard.py`) blocks
-  submit-like clicks, Enter, `submit=true` typing and click/submit scripts — **verified live** that hooks
-  block under `bypassPermissions`. A submit-like action the guard did not block → `needs_review`.
-  **Limitation:** the guard judges the tool input's description; a button that submits but is labelled
-  e.g. "Continue" cannot be recognised. Dry runs are therefore *not* submission-proof and must be supervised.
-- **CAPTCHA**: solving/CapSolver removed everywhere. Agent detects CAPTCHA / access restrictions, outputs
-  `RESULT:CAPTCHA` and stops; the worker moves on.
-- **Chrome**: only processes whose command line shows the ApplyPilot worker profile are ever killed; a
-  foreign listener on the CDP port makes launch refuse. No import-time exit hooks.
-- **Agent isolation**: `--strict-mcp-config` (user's MCP servers excluded). Still `bypassPermissions` with
-  built-in tools available — see security plan S1.
+  agent started, policy violations, and any non-APPLIED result after a submit-like action → `needs_review`.
+- **APPLIED needs evidence** (real runs): an observed submit action **and** a human approval grant **and**
+  confirmation text in a browser result afterwards; otherwise `uncertain:applied_without_evidence`.
+- **Dry runs** never become `applied`; and since the guard is best-effort, every *uncertain* dry run (incl.
+  interrupted after agent start, stale claims, agent claiming APPLIED) → `needs_review`, never requeued.
+- **Ownership**: claims carry `<session>:worker-N[:dry_run]`; results/releases apply only to the caller's
+  own claim. Stale claims (real or dry) → `needs_review`. A per-worker OS file lock stops a second
+  launcher from using (and killing) the same worker's Chrome/profile.
+- **Agent tool surface (S1)**: `--tools ""`, `--setting-sources ""`, `dontAsk` + `--allowedTools`
+  (13 browser tools), `--disallowedTools`, `--strict-mcp-config`, pinned `@playwright/mcp@0.0.86`.
+  Fail-closed: CLI flag check at start, init-event check (kills session), SessionStart canary, and a
+  hook audit record required for every tool call.
+- **Policy hooks (S2, all runs)** — `apply/policy.py`, `apply/policy_hook.py`: navigation only to the
+  job's domains + ATS list (no localhost/IPs/private/file:); uploads only the session's two PDFs;
+  SSN/card-like values blocked; PostToolUse tripwire halts the session if the page URL leaves the
+  allowlist. Dry-run submit guard included. Session files: `APP_DIR/apply-sessions/<id>/`.
+- **Submission authority (Task E)**: real runs need `--allow-real-submissions`; each submit-like action
+  blocks until `applypilot apply --approve <session> --nonce <id>` (10 min timeout → refused).
+- **Email (S3)**: no Gmail MCP. Optional `verification_mcp` (one argument-less tool, gmail.readonly only,
+  query fixed to session sender domains + start time) — enabled only if
+  `APP_DIR/secrets/gmail_readonly.json` exists. **Not live-tested** (no credentials configured).
+- **Secrets (S4)**: no password in prompts (account → `needs_review human:account_required`); empty
+  isolated worker profiles (never cloned; legacy unmarked profiles refused); logs redacted; agent env
+  stripped of API keys/tokens.
+- **CAPTCHA**: detect, `RESULT:CAPTCHA`, stop. Never solved.
+- **Live probe** (`scripts/live_policy_probe.py`, local synthetic pages only, 2026-11-27): init surface
+  OK (no built-ins, no evaluate); off-origin navigation blocked before any request; SSN typing blocked;
+  302 redirect to an internal server **detected and halted, but the GET reached it** (see issues).
 
 Resolving `needs_review`: check the portal/email, then `applypilot apply --mark-applied URL` or
 `--mark-failed URL` (then `--reset-failed` to requeue).
@@ -116,13 +127,22 @@ Totals: 5 eligible_nc + 6 eligible_us_remote ready to tailor; 6 NC-commute revie
   `~/.applypilot` untouched.
 - MCP: project-scoped `serena-applypilot` in `.mcp.json` (gitignored); Claude Code shows it *pending
   approval* — restart Claude Code in this repo and approve it. User-scope VIctory/xcl/fxceless servers untouched.
-- Tooling: Claude Code 2.1.332, Node 24, Chrome, uv, ripgrep, git; `gh` not installed. context-mode/RTK
+- Tooling: Claude Code 2.1.332, Node 24, Chrome, uv, ripgrep, git; `gh` not installed.
+  `python-jobspy` 1.5.0 installed in `.venv` with normal dependency resolution (it no longer pins numpy;
+  `pip check` clean, numpy 2.5.5 / pandas 3.1.1 unchanged); `doctor` reports it OK. context-mode/RTK
   condense output (use `ctx_execute` for large data, `Read` with offset/limit for source).
 
 ## Known remaining issues
-- Apply-agent exposures E1–E7 (`APPLY_AGENT_SECURITY_PLAN.md`), notably full built-in tools under
-  bypassPermissions and the cloned real Chrome profile.
-- No pre-apply liveness check; scores/descriptions are from 2026-11-23.
+- **Redirects / subresources**: the policy sees navigation only via tool inputs and resulting page URL.
+  A redirect (or page script) can make the browser *request* a private/off-list URL before the tripwire
+  halts the session. Fix: launcher-owned CDP `Fetch` interception (next security task).
+- **Dry runs are not submission-proof**: submit detection is label-based; an unlabelled submit is not
+  blocked (it is caught afterwards only if the agent reports oddly). Supervise every dry run.
+- Approval gate also keys on labels: an unrecognised submit control bypasses approval (APPLIED then lacks
+  evidence → `needs_review`, but the submission happened).
+- Hooks run as `sys.executable -m applypilot...`; tampering with the venv defeats them (trusted host).
+- User-global `~/.claude/CLAUDE.md` may still be loaded into the agent's context (no secrets in it).
+- No pre-apply liveness/freshness check; scores/descriptions are from 2026-11-23.
 - Duplicate detection is application-URL only (same role under different URLs not caught).
 - No `needs_review` listing command yet (`status` shows the count).
 - Repo-wide ruff has ~147 pre-existing upstream findings (CI red); touched files add none.
