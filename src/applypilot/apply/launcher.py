@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +26,7 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import chrome, dashboard, dry_run_guard, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -58,10 +59,18 @@ _claude_lock = threading.Lock()
 # Workers whose current job reached the agent (a submission may have happened).
 _agent_started: set[int] = set()
 
-# Register cleanup on exit
-atexit.register(cleanup_on_exit)
-if platform.system() != "Windows":
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+_exit_hooks_installed = False
+
+
+def _install_exit_hooks() -> None:
+    """Register Chrome cleanup and SIGTERM handling. Called from main(), never at import."""
+    global _exit_hooks_installed
+    if _exit_hooks_installed:
+        return
+    atexit.register(cleanup_on_exit)
+    if platform.system() != "Windows":
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    _exit_hooks_installed = True
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +112,8 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # Statuses that block acquisition of any other row sharing the same application_url.
 DUPLICATE_BLOCKING_STATUSES = ("applied", "in_progress", "needs_review")
 DRY_RUN_AGENT_SUFFIX = ":dry_run"
+# Identifies this launcher process in agent_id ("<session>:worker-N[:dry_run]") for claim ownership.
+SESSION_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 _JOB_COLUMNS = """j.url, j.title, j.site, j.application_url, j.tailored_resume_path,
                   j.fit_score, j.location, j.full_description, j.cover_letter_path"""
@@ -207,7 +218,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     return None
                 continue
 
-            agent_id = f"worker-{worker_id}" + (DRY_RUN_AGENT_SUFFIX if dry_run else "")
+            agent_id = f"{SESSION_ID}:worker-{worker_id}" + (DRY_RUN_AGENT_SUFFIX if dry_run else "")
             claimed = conn.execute("""
                 UPDATE jobs SET apply_status = 'in_progress',
                                agent_id = ?,
@@ -219,7 +230,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 conn.rollback()
                 return None
             conn.commit()
-            return dict(row)
+            job = dict(row)
+            job["agent_id"] = agent_id
+            return job
     except Exception:
         conn.rollback()
         raise
@@ -227,65 +240,95 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
-    """Update a job's apply status in the database.
+                task_id: str | None = None, owner: str | None = None) -> bool:
+    """Update a job's apply status in the database. Returns False if nothing was written.
 
     Only status 'applied' ever sets applied_at. Non-applied statuses never
     overwrite an 'applied' row. 'dry_run' and 'needs_review' leave
     apply_attempts untouched so they never consume retries.
+
+    With ``owner`` (the agent_id from acquire_job) the write only happens
+    while the row is still that owner's in-progress claim, so a late result
+    can never overwrite another worker's claim, a stale-lock recovery or a
+    human's --mark-applied/--mark-failed decision. A late result for a row
+    already under review is appended to its apply_error for the reviewer.
     """
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    not_applied = "AND (apply_status IS NULL OR apply_status != 'applied')"
+    if owner is not None:
+        guard, guard_params = "AND apply_status = 'in_progress' AND agent_id = ?", [owner]
+    elif status == "applied":
+        guard, guard_params = "", []
+    else:
+        guard, guard_params = "AND (apply_status IS NULL OR apply_status != 'applied')", []
+
     if status == "applied":
-        conn.execute("""
+        cur = conn.execute(f"""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (now, duration_ms, task_id, url))
+            WHERE url = ? {guard}
+        """, [now, duration_ms, task_id, url, *guard_params])
     elif status in ("dry_run", "needs_review"):
-        conn.execute(f"""
+        cur = conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ? {not_applied}
-        """, (status, error, duration_ms, task_id, url))
+            WHERE url = ? {guard}
+        """, [status, error, duration_ms, task_id, url, *guard_params])
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        conn.execute(f"""
+        cur = conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ? {not_applied}
-        """, (status, error or "unknown", duration_ms, task_id, url))
+            WHERE url = ? {guard}
+        """, [status, error or "unknown", duration_ms, task_id, url, *guard_params])
+
+    written = cur.rowcount == 1
+    if not written and owner is not None:
+        late = f"{status}:{error}" if error else status
+        conn.execute("""
+            UPDATE jobs SET apply_error = COALESCE(apply_error, '') || ' | late result: ' || ?
+            WHERE url = ? AND apply_status = 'needs_review'
+        """, (late[:120], url))
+        logger.warning("Ownership of %s lost before result '%s' was recorded", url[:80], late[:60])
     conn.commit()
+    return written
 
 
 def record_outcome(url: str, result: str, dry_run: bool,
-                   duration_ms: int | None = None) -> str:
-    """Persist an agent result. Returns 'applied', 'dry_run', 'needs_review' or 'failed'.
+                   duration_ms: int | None = None, owner: str | None = None) -> str:
+    """Persist an agent result.
+
+    Returns 'applied', 'dry_run', 'needs_review', 'failed', or
+    'ownership_lost' when the claim was no longer ours (nothing overwritten).
 
     Launcher-side enforcement: a dry run can never be recorded as applied,
-    whatever the agent reports, and never consumes retry attempts. In real
-    runs, outcomes where a submission may have happened ('uncertain:*') go
-    to human review instead of being retried.
+    whatever the agent reports, and never consumes retry attempts; a dry run
+    whose submit-like action was not blocked by the guard goes to review. In
+    real runs, outcomes where a submission may have happened ('uncertain:*')
+    go to human review instead of being retried.
     """
     if dry_run:
-        note = None if result in ("applied", "dry_run") else f"dry_run:{result}"
-        mark_result(url, "dry_run", note, duration_ms=duration_ms)
-        return "dry_run"
-    if result == "applied":
-        mark_result(url, "applied", duration_ms=duration_ms)
-        return "applied"
+        if result == "uncertain:dry_run_submit_not_blocked":
+            status, note, outcome = "needs_review", result, "needs_review"
+        else:
+            note = None if result in ("applied", "dry_run") else f"dry_run:{result}"
+            status, outcome = "dry_run", "dry_run"
+        written = mark_result(url, status, note, duration_ms=duration_ms, owner=owner)
+        return outcome if written else "ownership_lost"
     if result == "dry_run":
         result = "uncertain:unexpected_dry_run_result"
-    if result.startswith("uncertain:"):
-        mark_result(url, "needs_review", result, duration_ms=duration_ms)
-        return "needs_review"
-    reason = result.split(":", 1)[-1] if ":" in result else result
-    mark_result(url, "failed", reason, permanent=_is_permanent_failure(result),
-                duration_ms=duration_ms)
-    return "failed"
+    if result == "applied":
+        status, error, permanent, outcome = "applied", None, False, "applied"
+    elif result.startswith("uncertain:"):
+        status, error, permanent, outcome = "needs_review", result, False, "needs_review"
+    else:
+        reason = result.split(":", 1)[-1] if ":" in result else result
+        status, error, permanent, outcome = "failed", reason, _is_permanent_failure(result), "failed"
+    written = mark_result(url, status, error, permanent=permanent,
+                          duration_ms=duration_ms, owner=owner)
+    return outcome if written else "ownership_lost"
 
 
 def recover_stale_locks(max_age_seconds: int | None = None) -> int:
@@ -299,31 +342,38 @@ def recover_stale_locks(max_age_seconds: int | None = None) -> int:
         Number of rows recovered.
     """
     if max_age_seconds is None:
-        max_age_seconds = APPLY_MAX_SECONDS + 300
+        # A live claim cannot outlast the watchdog plus Chrome start-up and process shutdown.
+        max_age_seconds = APPLY_MAX_SECONDS + config.DEFAULTS["apply_timeout"] + 300
     cutoff = datetime.fromtimestamp(time.time() - max_age_seconds, tz=timezone.utc).isoformat()
-    stale = "apply_status = 'in_progress' AND (last_attempted_at IS NULL OR last_attempted_at < ?)"
+    # Never touch this process's own claims; other instances' claims only once provably stale.
+    stale = ("apply_status = 'in_progress' AND (last_attempted_at IS NULL OR last_attempted_at < ?)"
+             " AND (agent_id IS NULL OR agent_id NOT LIKE ?)")
+    own = f"{SESSION_ID}:%"
     conn = get_connection()
     released = conn.execute(f"""
         UPDATE jobs SET apply_status = NULL, agent_id = NULL
         WHERE {stale} AND agent_id LIKE ?
-    """, (cutoff, f"%{DRY_RUN_AGENT_SUFFIX}")).rowcount
+    """, (cutoff, own, f"%{DRY_RUN_AGENT_SUFFIX}")).rowcount
     flagged = conn.execute(f"""
         UPDATE jobs SET apply_status = 'needs_review',
                        apply_error = 'uncertain:interrupted_stale_lock', agent_id = NULL
         WHERE {stale}
-    """, (cutoff,)).rowcount
+    """, (cutoff, own)).rowcount
     conn.commit()
     return released + flagged
 
 
-def release_lock(url: str) -> None:
-    """Release the in_progress lock without changing status."""
+def release_lock(url: str, owner: str | None = None) -> bool:
+    """Release an in_progress claim without changing status (only our own claim if owner given)."""
     conn = get_connection()
-    conn.execute(
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
-    )
+    sql = "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'"
+    params: list = [url]
+    if owner is not None:
+        sql += " AND agent_id = ?"
+        params.append(owner)
+    released = conn.execute(sql, params).rowcount == 1
     conn.commit()
+    return released
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +401,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
     prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
 
     # Release the lock so the job stays available
-    release_lock(job["url"])
+    release_lock(job["url"], owner=job["agent_id"])
 
     # Write prompt file
     config.ensure_dirs()
@@ -416,34 +466,141 @@ def reset_failed() -> int:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
-_RESULT_RE = re.compile(r"RESULT:([A-Z_]+)(?::[ \t]*([^\n]*))?")
+# A result line must stand alone: optional markdown decoration, the code, an optional
+# ":reason" and an optional " -- comment". Inline mentions in prose are ignored.
+_RESULT_LINE_RE = re.compile(
+    r"RESULT:(?P<code>[A-Z_]+)(?::[ \t]*(?P<reason>[A-Za-z0-9_\- ]{1,80}?))?(?:[ \t]+--[^\n]*)?"
+)
 _SIMPLE_RESULTS = {"APPLIED", "DRY_RUN", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"}
 _PROMOTE_FAILURE_REASONS = {"captcha", "expired", "login_issue"}
+# Failure reasons that themselves imply a submission may already have happened.
+_POST_SUBMIT_FAILURES = {"captcha_after_submit"}
 
 
-def parse_agent_result(output: str) -> str:
-    """Classify the agent's transcript into a launcher result string.
+def parse_agent_result(final_text: str | None) -> str:
+    """Classify the agent's FINAL reply (stream-json ``result`` event) into a result string.
 
-    Returns 'applied', 'dry_run', 'expired', 'captcha', 'login_issue',
-    'failed:<reason>' or 'uncertain:<reason>'. The LAST result code wins
-    (the agent may mention codes while planning). A transcript claiming
-    APPLIED alongside any other code is ambiguous and is never trusted.
+    Only standalone result lines count, so result codes quoted in reasoning,
+    web pages or tool output cannot establish anything. Returns 'applied',
+    'dry_run', 'expired', 'captcha', 'login_issue', 'failed:<reason>' or
+    'uncertain:<reason>'. Missing, malformed or conflicting results are
+    uncertain and go to human review.
     """
-    matches = _RESULT_RE.findall(output or "")
-    if not matches:
+    if final_text is None:
+        return "uncertain:no_final_result"
+    found: list[tuple[str, str]] = []
+    for raw in final_text.splitlines():
+        line = re.sub(r"[*`]", "", raw).strip().lstrip(">#_ ").rstrip("_ ").strip()
+        if not line.startswith("RESULT:"):
+            continue
+        match = _RESULT_LINE_RE.fullmatch(line)
+        if not match:
+            return "uncertain:malformed_result"
+        found.append((match["code"], (match["reason"] or "").strip()))
+    if not found:
         return "uncertain:no_result_line"
-    codes = {code for code, _ in matches}
-    if "APPLIED" in codes and len(codes) > 1:
+    if len(set(found)) > 1:
         return "uncertain:conflicting_results"
-    code, reason = matches[-1]
-    if code in _SIMPLE_RESULTS:
+    code, reason = found[0]
+    if code in _SIMPLE_RESULTS and not reason:
         return code.lower()
     if code == "FAILED":
-        reason = re.sub(r'[*`"]+$', "", reason or "").strip() or "unknown"
+        reason = reason or "unknown"
+        if reason.lower() in _POST_SUBMIT_FAILURES:
+            return f"uncertain:{reason.lower()}"
         if reason.lower() in _PROMOTE_FAILURE_REASONS:
             return reason.lower()
         return f"failed:{reason}"
-    return f"uncertain:unrecognized_result_{code.lower()}"
+    return "uncertain:malformed_result"
+
+
+def classify_session(final_text: str | None, *, final_is_error: bool, dry_run: bool,
+                     submit_attempts: int, unblocked_submits: int,
+                     watchdog_fired: bool = False, interrupted: bool = False) -> str:
+    """Combine the agent's final reply with launcher observations into one result.
+
+    The agent's own claim is never enough on its own:
+    - a session killed by the watchdog / interrupted, or one that ended in an
+      agent error, is uncertain unless it produced a clean result;
+    - in a real run, any non-APPLIED result after a submit-like action means
+      a submission may have happened -> uncertain (human review);
+    - in a dry run, a submit-like action the guard did not block means a real
+      submission may have happened -> 'uncertain:dry_run_submit_not_blocked'.
+    """
+    result = parse_agent_result(final_text)
+    if watchdog_fired:
+        result = "uncertain:watchdog_timeout"
+    elif interrupted and result.startswith("uncertain:"):
+        result = "uncertain:interrupted"
+    elif final_is_error and not result.startswith("uncertain:"):
+        result = f"uncertain:agent_error_after_{result.replace(':', '_')}"
+    if dry_run:
+        if unblocked_submits:
+            return "uncertain:dry_run_submit_not_blocked"
+        return result
+    if submit_attempts and result != "applied" and not result.startswith("uncertain:"):
+        return f"uncertain:after_submit_action:{result}"
+    return result
+
+
+def is_submit_action(tool_name: str, tool_input: dict) -> bool:
+    """True when a tool call looks like it commits an application (click Submit, send email)."""
+    name = (tool_name or "").split("__")[-1]
+    if name == "send_email":
+        return True
+    if name in {"browser_click", "browser_double_click"}:
+        label = " ".join(str((tool_input or {}).get(k, "")) for k in ("element", "text", "name"))
+        return bool(dry_run_guard.SUBMIT_WORDS.search(label))
+    return False
+
+
+GMAIL_ALWAYS_DISALLOWED = (
+    "mcp__gmail__modify_email", "mcp__gmail__delete_email", "mcp__gmail__download_attachment",
+    "mcp__gmail__batch_modify_emails", "mcp__gmail__batch_delete_emails",
+    "mcp__gmail__create_label", "mcp__gmail__update_label", "mcp__gmail__delete_label",
+    "mcp__gmail__get_or_create_label", "mcp__gmail__list_email_labels",
+    "mcp__gmail__create_filter", "mcp__gmail__list_filters", "mcp__gmail__get_filter",
+    "mcp__gmail__delete_filter", "mcp__gmail__draft_email",
+)
+GMAIL_DRY_RUN_DISALLOWED = ("mcp__gmail__send_email",)
+
+
+def dry_run_guard_settings() -> dict:
+    """Claude Code settings that install the dry-run PreToolUse guard hook."""
+    command = f'"{sys.executable}" -m applypilot.apply.dry_run_guard'
+    return {"hooks": {"PreToolUse": [
+        {"matcher": "mcp__playwright__.*|mcp__gmail__.*",
+         "hooks": [{"type": "command", "command": command}]},
+    ]}}
+
+
+def build_agent_command(model: str, mcp_config_path: Path, dry_run: bool,
+                        settings_path: Path | None = None) -> list[str]:
+    """Build the Claude Code command line for one application session.
+
+    --strict-mcp-config keeps the user's own MCP servers out of the agent.
+    Dry runs additionally block email sending outright and install the
+    dry-run guard hook (settings_path) that refuses submit-like tool calls.
+    """
+    disallowed = list(GMAIL_ALWAYS_DISALLOWED)
+    if dry_run:
+        disallowed += GMAIL_DRY_RUN_DISALLOWED
+    cmd = [
+        "claude",
+        "--model", model,
+        "-p",
+        "--mcp-config", str(mcp_config_path),
+        "--strict-mcp-config",
+        "--permission-mode", "bypassPermissions",
+        "--no-session-persistence",
+        "--disallowedTools", ",".join(disallowed),
+    ]
+    if dry_run:
+        if settings_path is None:
+            raise ValueError("dry runs require the guard settings file")
+        cmd += ["--settings", str(settings_path)]
+    cmd += ["--output-format", "stream-json", "--verbose", "-"]
+    return cmd
 
 
 def run_job(job: dict, port: int, worker_id: int = 0,
@@ -473,27 +630,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
+    settings_path = None
+    if dry_run:
+        settings_path = config.APP_DIR / f".apply-dry-run-settings-{worker_id}.json"
+        settings_path.write_text(json.dumps(dry_run_guard_settings()), encoding="utf-8")
+    cmd = build_agent_command(model, mcp_config_path, dry_run, settings_path)
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
@@ -552,6 +693,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.stdin.close()
 
         text_parts: list[str] = []
+        final_text: str | None = None  # structured final reply from the "result" event
+        final_is_error = False
+        submit_ids: set[str] = set()  # tool_use ids of submit-like actions
+        guard_blocked_ids: set[str] = set()  # ids the dry-run guard refused
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
@@ -587,6 +732,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     desc = name
 
                                 lf.write(f"  >> {desc}\n")
+                                if is_submit_action(block.get("name", ""), inp):
+                                    submit_ids.add(block.get("id", f"anon-{len(submit_ids)}"))
+                                    lf.write("  !! submit-like action\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
                                 update_state(worker_id,
@@ -601,7 +749,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             "cost_usd": msg.get("total_cost_usd", 0),
                             "turns": msg.get("num_turns", 0),
                         }
-                        text_parts.append(msg.get("result", ""))
+                        final_text = msg.get("result") or ""
+                        final_is_error = bool(msg.get("is_error"))
+                        text_parts.append(final_text)
+                    elif msg_type == "user":
+                        for block in msg.get("message", {}).get("content", []):
+                            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                                    and "DRY RUN GUARD" in str(block.get("content", ""))):
+                                guard_blocked_ids.add(block.get("tool_use_id", ""))
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
@@ -624,12 +779,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
 
-        result = parse_agent_result(output)
-        if result.startswith("uncertain:"):
-            if watchdog_fired.is_set():
-                result = "uncertain:watchdog_timeout"
-            elif returncode and returncode < 0:
-                result = "uncertain:interrupted"
+        result = classify_session(
+            final_text, final_is_error=final_is_error, dry_run=dry_run,
+            submit_attempts=len(submit_ids),
+            unblocked_submits=len(submit_ids - guard_blocked_ids),
+            watchdog_fired=watchdog_fired.is_set(),
+            interrupted=bool(returncode and returncode < 0),
+        )
 
         label, _, detail = result.partition(":")
         add_event(f"[W{worker_id}] {label.upper()} ({elapsed}s): {(detail or job['title'])[:30]}")
@@ -689,19 +845,21 @@ def _is_permanent_failure(result: str) -> bool:
 # Worker loop
 # ---------------------------------------------------------------------------
 
-def _release_interrupted(url: str, worker_id: int, dry_run: bool, reason: str) -> None:
+def _release_interrupted(url: str, worker_id: int, dry_run: bool, reason: str,
+                         owner: str | None = None) -> None:
     """Handle a job abandoned mid-flight (Ctrl+C or launcher error).
 
     If the agent never started, or this is a dry run, the claim is simply
     released. Otherwise the agent may already have submitted, so the job is
     flagged for human review rather than silently returned to the queue.
+    Only this worker's own claim (owner) is ever touched.
     """
     with _claude_lock:
         started = worker_id in _agent_started
     if started and not dry_run:
-        mark_result(url, "needs_review", reason)
+        mark_result(url, "needs_review", reason, owner=owner)
     else:
-        release_lock(url)
+        release_lock(url, owner=owner)
 
 
 def worker_loop(worker_id: int = 0, limit: int = 1,
@@ -766,8 +924,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                             model=model, dry_run=dry_run)
 
             outcome = record_outcome(job["url"], result, dry_run=dry_run,
-                                     duration_ms=duration_ms)
-            if outcome == "applied" or (dry_run and result in ("applied", "dry_run")):
+                                     duration_ms=duration_ms, owner=job["agent_id"])
+            if outcome == "ownership_lost":
+                add_event(f"[W{worker_id}] CLAIM LOST, result not recorded: {job['title'][:30]}")
+            if outcome == "applied" or (outcome == "dry_run" and result in ("applied", "dry_run")):
                 applied += 1
             else:
                 failed += 1
@@ -777,7 +937,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                          jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            _release_interrupted(job["url"], worker_id, dry_run, "uncertain:interrupted")
+            _release_interrupted(job["url"], worker_id, dry_run, "uncertain:interrupted",
+                                 owner=job["agent_id"])
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -786,7 +947,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
             _release_interrupted(job["url"], worker_id, dry_run,
-                                 f"uncertain:launcher_error:{str(e)[:80]}")
+                                 f"uncertain:launcher_error:{str(e)[:80]}", owner=job["agent_id"])
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
@@ -828,6 +989,7 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+    _install_exit_hooks()
 
     recovered = recover_stale_locks()
     if recovered:

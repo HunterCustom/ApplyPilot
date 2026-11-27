@@ -61,36 +61,71 @@ def _kill_process_tree(pid: int) -> None:
         logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
 
 
-def _kill_on_port(port: int) -> None:
-    """Kill any process listening on a specific port (zombie cleanup).
+def parse_netstat_listeners(netstat_output: str, port: int) -> list[int]:
+    """PIDs LISTENING on exactly ``port`` (local address column) in `netstat -ano` output."""
+    pids = []
+    for line in netstat_output.splitlines():
+        parts = line.split()
+        if (len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3] == "LISTENING"
+                and parts[1].rsplit(":", 1)[-1] == str(port) and parts[4].isdigit()):
+            pids.append(int(parts[4]))
+    return sorted(set(pids))
 
-    Uses netstat on Windows, lsof on macOS/Linux.
-    """
+
+def _listening_pids(port: int) -> list[int]:
+    if platform.system() == "Windows":
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                             capture_output=True, text=True, timeout=10, check=False).stdout
+        return parse_netstat_listeners(out, port)
+    out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                         capture_output=True, text=True, timeout=10, check=False).stdout
+    return sorted({int(p) for p in out.split() if p.strip().isdigit()})
+
+
+def _process_command_line(pid: int) -> str:
     try:
         if platform.system() == "Windows":
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit():
-                        _kill_process_tree(int(pid))
+            cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                   f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"]
         else:
-            # macOS / Linux
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for pid_str in result.stdout.strip().splitlines():
-                pid_str = pid_str.strip()
-                if pid_str.isdigit():
-                    _kill_process_tree(int(pid_str))
-    except FileNotFoundError:
-        logger.debug("Port-kill tool not found (netstat/lsof) for port %d", port)
+            cmd = ["ps", "-o", "args=", "-p", str(int(pid))]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False).stdout.strip()
     except Exception:
-        logger.debug("Failed to kill process on port %d", port, exc_info=True)
+        logger.debug("Could not read command line for PID %d", pid, exc_info=True)
+        return ""
+
+
+def is_worker_chrome(command_line: str) -> bool:
+    """True only for a Chrome started by ApplyPilot (its isolated worker profile dir)."""
+    norm = command_line.replace("\\", "/").lower()
+    worker_dir = str(config.CHROME_WORKER_DIR).replace("\\", "/").lower()
+    return bool(worker_dir) and worker_dir in norm and "--remote-debugging-port" in norm
+
+
+def _kill_on_port(port: int) -> bool:
+    """Kill leftover ApplyPilot worker Chrome processes listening on ``port``.
+
+    Processes that are not ApplyPilot worker Chrome (the user's own browser,
+    another tool using the port) are never touched. Returns True if the port
+    is free afterwards as far as we know, False if a foreign process holds it.
+    """
+    try:
+        pids = _listening_pids(port)
+    except FileNotFoundError:
+        logger.debug("Port tool not found (netstat/lsof) for port %d", port)
+        return True
+    except Exception:
+        logger.debug("Failed to list listeners on port %d", port, exc_info=True)
+        return True
+    foreign = False
+    for pid in pids:
+        if is_worker_chrome(_process_command_line(pid)):
+            _kill_process_tree(pid)
+        else:
+            foreign = True
+            logger.warning("Port %d is held by PID %d, which is not ApplyPilot Chrome; leaving it alone",
+                           port, pid)
+    return not foreign
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +238,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     profile_dir = setup_worker_profile(worker_id)
 
-    # Kill any zombie Chrome from a previous run on this port
-    _kill_on_port(port)
+    # Kill a leftover ApplyPilot Chrome from a previous run on this port (never anything else)
+    if not _kill_on_port(port):
+        raise RuntimeError(
+            f"CDP port {port} is in use by a process that is not ApplyPilot Chrome; "
+            "refusing to terminate it. Free the port and retry."
+        )
 
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
@@ -278,10 +317,7 @@ def kill_all_chrome() -> None:
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
-
-    # Sweep base port in case of zombies
-    _kill_on_port(BASE_CDP_PORT)
+        _kill_on_port(BASE_CDP_PORT + wid)  # ownership-checked: only ApplyPilot Chrome
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -315,7 +351,4 @@ def cleanup_on_exit() -> None:
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
-
-    # Sweep base port for any orphan
-    _kill_on_port(BASE_CDP_PORT)
+        _kill_on_port(BASE_CDP_PORT + wid)  # ownership-checked: only ApplyPilot Chrome

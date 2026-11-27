@@ -432,13 +432,12 @@ def doctor() -> None:
         results.append(("Node.js (npx)", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
-    # CapSolver (optional)
-    capsolver = os.environ.get("CAPSOLVER_API_KEY")
-    if capsolver:
-        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
+    # CAPTCHA policy: detect and stop; solving services are never used.
+    if os.environ.get("CAPSOLVER_API_KEY"):
+        results.append(("CAPTCHA policy", warn_mark,
+                        "CAPSOLVER_API_KEY is set but ignored: CAPTCHAs are detected and skipped"))
     else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+        results.append(("CAPTCHA policy", ok_mark, "Detect and skip (never solved or bypassed)"))
 
     # --- Render results ---
     console.print()
