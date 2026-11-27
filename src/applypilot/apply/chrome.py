@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import threading
 import time
+import typing
 from pathlib import Path
 
 from applypilot import config
@@ -137,7 +138,7 @@ def _kill_on_port(port: int) -> bool:
 PROFILE_MARKER = ".applypilot-isolated"
 
 # Per-worker slot locks held by this process (OS file locks, released on process exit).
-_slot_handles: dict[int, object] = {}
+_slot_handles: dict[int, typing.BinaryIO] = {}
 
 
 def acquire_worker_slot(worker_id: int) -> None:

@@ -42,3 +42,8 @@ Thumbs.db
 
 # Serena (local cache + machine-specific memories)
 .serena/
+graphify-out/
+
+.coverage
+coverage.xml
+htmlcov/

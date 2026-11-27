@@ -179,7 +179,7 @@ class Server:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}}
         return {"jsonrpc": "2.0", "id": rid, "result": result}
 
-    def _call(self, name: str) -> dict:
+    def _call(self, name: str | None) -> dict:
         if name != TOOL_NAME:
             return {"content": [{"type": "text", "text": "unknown tool"}], "isError": True}
         self.calls += 1

@@ -66,11 +66,33 @@ Python 3.13 venv at `.venv`. Default LLM: local LM Studio at `http://127.0.0.1:1
 - `database.py` — single `jobs` table, `url` is the PK; stage state is columns (fit_score, tailored_resume_path, apply_status…).
 - LLM provider precedence (`llm.py`): `LLM_URL` wins over GEMINI/OPENAI keys; `LLM_MODEL` overrides model.
 
+## Token-efficient workflow
+1. Navigate with `serena-applypilot` symbol tools (`get_symbols_overview`, `find_symbol` with
+   `include_body`, `find_referencing_symbols`) before reading whole files.
+2. Use `graphify-applypilot` (`query_graph`, `get_neighbors`, `shortest_path`) for cross-module questions.
+   Rebuild after structural changes: `graphify update .` (code only, no LLM; scope in `.graphifyignore`).
+3. Noisy shell commands go through RTK (automatic); `rtk bypass <cmd>` only when output is unusable.
+4. Large outputs/logs/data: `ctx_execute` and print only the answer; `Read` with `offset/limit` for source.
+5. Don't reread files that haven't changed; don't repeat tool calls whose result is already known.
+6. Targeted tests while implementing (`pytest tests/test_x.py -k ...`); full suite + ruff diff before commit.
+7. Keep `PROJECT_STATUS.md` / `DEVELOPMENT_ROADMAP.md` / `APPLY_AGENT_SECURITY_PLAN.md` concise and current.
+8. No subagents unless the user asks; no redundant tool calls.
+9. Check context quality (`measure.py quick` / Token Optimizer) at task boundaries.
+10. Below 65/100: finish the current atomic task, test, commit, update docs, hand off and restart.
+Compression must never hide what correctness needs: for security reviews, debugging, test failures and
+diffs, read the full output (`rtk bypass`, `Read` ranges, `ctx_search` on the archived result).
+
+Dev tools are for this trusted environment only. Never give the apply agent dev MCP servers, shell,
+repository or personal-file access: it runs with `--tools ""`, `--setting-sources ""` and
+`--strict-mcp-config`, and `verify_init_event` kills any session that sees more.
+
 ## Tooling notes
+- Quality checks: `.venv\Scripts\pyright.exe <files>` (basic mode, `[tool.pyright]`; ~85 pre-existing
+  repo errors — don't add new ones), `pytest --cov=applypilot.apply --cov-report=term`.
 - Output from shell/Read is condensed by RTK/context-mode. Use `ctx_execute` to compute answers
   over large data; use `Read` with `offset/limit` for source files; `rtk bypass` only if output is unusable.
 - User-scope Serena/Graphify servers belong to other projects (F:\ drive) — never modify them.
-  Project-scoped `serena-applypilot` is defined in `.mcp.json` (gitignored; needs approval on first start).
-  Prefer its symbol tools for navigation once approved; otherwise Grep/Read. `.serena/` is gitignored.
+  Project-scoped `serena-applypilot` and `graphify-applypilot` are defined in `.mcp.json` (gitignored)
+  and enabled in `.claude/settings.local.json`. `.serena/` and `graphify-out/` are gitignored.
 - Commit messages: write to a scratchpad file and `git commit -F <file>` (PowerShell here-strings piped to `-F -` fail).
 - `gh` CLI is not installed; use git + the GitHub web UI for PRs.

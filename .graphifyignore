@@ -1,0 +1,40 @@
+# Graphify index scope: source, tests and technical docs only.
+# Never index environments, VCS, tool state, secrets, applicant data, transcripts,
+# browser profiles, databases or generated application documents.
+.venv/
+.git/
+.github/
+.serena/
+.claude/
+.pytest_cache/
+.ruff_cache/
+graphify-out/
+**/__pycache__/
+.env
+.env.*
+*.env
+.mcp*.json
+*.db
+*.db-*
+*.sqlite*
+profile.json
+profile.example.json
+resume.*
+*.pdf
+*.docx
+candidate_evidence*.yaml
+priority.yaml
+searches.yaml
+answers.yaml
+secrets/
+logs/
+*.log
+apply-sessions/
+apply-workers/
+apply_logs/
+chrome-workers/
+tailored_resumes/
+cover_letters/
+dashboard.html
+CHANGELOG.md
+LICENSE
