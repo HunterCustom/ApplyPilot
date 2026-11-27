@@ -39,3 +39,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Serena (local cache + machine-specific memories)
+.serena/
