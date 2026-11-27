@@ -331,6 +331,12 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs WHERE apply_status = 'needs_review'"
     ).fetchone()[0]
 
+    stats["eligibility"] = [
+        (row[0] or "unclassified", row[1]) for row in conn.execute(
+            "SELECT eligibility_status, COUNT(*) FROM jobs GROUP BY eligibility_status ORDER BY 2 DESC"
+        ).fetchall()
+    ]
+
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
@@ -395,20 +401,24 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if conn is None:
         conn = get_connection()
 
+    from applypilot.eligibility import SQL_ELIGIBLE, SQL_NOT_INELIGIBLE
+
     conditions = {
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL",
         "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        # Ineligible jobs never consume LLM scoring; unknown/review jobs are still scored.
+        "pending_score": f"full_description IS NOT NULL AND fit_score IS NULL AND {SQL_NOT_INELIGIBLE}",
         "scored": "fit_score IS NOT NULL",
+        # Tailoring and applying require verified eligibility.
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            f"AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5 AND {SQL_ELIGIBLE}"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
-            "AND application_url IS NOT NULL"
+            f"AND application_url IS NOT NULL AND {SQL_ELIGIBLE}"
         ),
         "applied": "applied_at IS NOT NULL",
     }

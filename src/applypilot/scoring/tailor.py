@@ -471,6 +471,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
+    # Only verified-eligible jobs are tailored; classify any not yet evaluated by the current version.
+    from applypilot.eligibility import classify_jobs
+    classify_jobs(conn)
     jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
 
     if not jobs:

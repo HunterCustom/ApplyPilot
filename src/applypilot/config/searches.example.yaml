@@ -61,7 +61,18 @@ locations:
   - location: "Remote"
     remote: true
 
-# Location filters for *non-remote* jobs (remote eligibility is checked later).
+# Deterministic geographic eligibility (gates tailoring and applying; see applypilot/eligibility.py).
+# Without this section, location_accept entries below are used as the accepted onsite cities.
+# eligibility:
+#   home_state: NC
+#   commute_tiers:              # onsite/hybrid cities in the home state, best first
+#     highest: [Burlington, Graham, Mebane]
+#     high: [Greensboro]
+#     acceptable: [Durham, Raleigh]
+#   other_nc: review            # other home-state cities: review | eligible | ineligible
+#   aliases: {rtp: Durham}
+
+# Location filters for *non-remote* jobs at discovery time.
 location_accept:
   - "San Francisco"
   - "Bay Area"

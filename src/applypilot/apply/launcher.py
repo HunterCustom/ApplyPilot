@@ -24,7 +24,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 
-from applypilot import config
+from applypilot import config, eligibility
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, dry_run_guard, prompt as prompt_mod
 from applypilot.apply.chrome import (
@@ -116,7 +116,16 @@ DRY_RUN_AGENT_SUFFIX = ":dry_run"
 SESSION_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 _JOB_COLUMNS = """j.url, j.title, j.site, j.application_url, j.tailored_resume_path,
-                  j.fit_score, j.location, j.full_description, j.cover_letter_path"""
+                  j.fit_score, j.location, j.full_description, j.cover_letter_path,
+                  j.eligibility_status, j.eligibility_reason"""
+
+# Only verified-eligible jobs can be claimed, in queue mode AND for explicit --url targets.
+# Automatic decisions must come from the current classifier version; human approvals always count.
+_ELIGIBLE_CLAUSE = (
+    f"j.eligibility_status IN ({','.join(repr(s) for s in eligibility.ELIGIBLE_STATUSES)})"
+    f" AND (j.eligibility_version = '{eligibility.CLASSIFIER_VERSION}'"
+    f" OR j.eligibility_version = '{eligibility.MANUAL_VERSION}')"
+)
 
 # No other row for the same application URL may already be applied, claimed or under review.
 _NO_DUPLICATE_CLAUSE = f"""NOT EXISTS (
@@ -142,6 +151,7 @@ def _select_target(conn, target_url: str):
                OR j.application_url LIKE ? ESCAPE '\\' OR j.url LIKE ? ESCAPE '\\')
           AND j.tailored_resume_path IS NOT NULL
           AND (j.apply_status IS NULL OR j.apply_status IN ('failed', 'dry_run'))
+          AND {_ELIGIBLE_CLAUSE}
           AND {_NO_DUPLICATE_CLAUSE}
         ORDER BY (j.url = ? OR j.application_url = ?) DESC, j.url
         LIMIT 1
@@ -170,8 +180,11 @@ def _select_next(conn, min_score: int, dry_run: bool):
           AND j.fit_score >= ?
           {site_clause}
           {url_clauses}
+          AND {_ELIGIBLE_CLAUSE}
           AND {_NO_DUPLICATE_CLAUSE}
-        ORDER BY j.fit_score DESC, j.url
+        ORDER BY CASE j.eligibility_tier WHEN 'highest' THEN 0 WHEN 'high' THEN 1
+                      WHEN 'acceptable' THEN 2 ELSE 3 END,
+                 j.fit_score DESC, j.url
         LIMIT 1
     """, params).fetchone()
 
@@ -236,6 +249,28 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     except Exception:
         conn.rollback()
         raise
+
+
+def explain_target(target_url: str) -> str | None:
+    """Why an explicit --url target cannot be acquired, or None if it can (read-only)."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT url, apply_status, tailored_resume_path, eligibility_status, eligibility_reason,
+               eligibility_version
+        FROM jobs WHERE url = ? OR application_url = ?
+    """, (target_url, target_url)).fetchall()
+    if not rows:
+        return None  # may still match by substring; acquire_job decides
+    row = rows[0]
+    status = row["eligibility_status"]
+    if status not in eligibility.ELIGIBLE_STATUSES:
+        return (f"eligibility is '{status or 'unclassified'}' ({row['eligibility_reason'] or 'not evaluated'}). "
+                "Review it with `applypilot eligibility`; approve with --approve URL if appropriate.")
+    if row["apply_status"] in DUPLICATE_BLOCKING_STATUSES:
+        return f"apply status is '{row['apply_status']}'"
+    if not row["tailored_resume_path"]:
+        return "no tailored resume yet (run `applypilot run tailor`)"
+    return None
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -821,7 +856,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue",
-    "not_eligible_location", "not_eligible_salary",
+    "not_eligible_location", "not_eligible_salary", "location_unclear",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
@@ -995,9 +1030,18 @@ def main(limit: int = 1, target_url: str | None = None,
     if recovered:
         console.print(f"[yellow]Recovered {recovered} stale in-progress job(s); "
                       "real-run ones are marked needs_review.[/yellow]")
+    reclassified = eligibility.classify_jobs()
+    if reclassified:
+        console.print(f"[dim]Eligibility (re)classified: {reclassified}[/dim]")
+    if target_url:
+        reason = explain_target(target_url)
+        if reason:
+            console.print(f"[red]Not applying to {target_url}:[/red] {reason}")
+            return
     if dry_run:
-        console.print("[bold yellow]DRY RUN: applications will not be submitted or "
-                      "recorded as applied.[/bold yellow]")
+        console.print("[bold yellow]DRY RUN: the agent is instructed not to submit, email sending is "
+                      "disabled and a guard hook blocks submit-like actions. This is best-effort, "
+                      "not a guarantee: supervise every dry run.[/bold yellow]")
 
     if continuous:
         effective_limit = 0

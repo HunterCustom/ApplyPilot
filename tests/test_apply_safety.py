@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from applypilot import database
+from applypilot import database, eligibility
 from applypilot.apply import chrome, launcher
 
 # Importing the launcher registers a Chrome/CDP-port cleanup hook; never run it from tests.
@@ -38,14 +38,18 @@ class ApplySafetyTestCase(unittest.TestCase):
         self.conn = conn
 
     def add_job(self, url, score=8, app_url=None, status=None, attempts=None,
-                applied_at=None, agent_id=None, last_attempted_at=None):
+                applied_at=None, agent_id=None, last_attempted_at=None,
+                elig="eligible_nc", elig_version=eligibility.CLASSIFIER_VERSION, tier="high"):
         self.conn.execute(
             """INSERT INTO jobs (url, title, site, application_url, tailored_resume_path,
                                  fit_score, apply_status, apply_attempts, applied_at,
-                                 agent_id, last_attempted_at, discovered_at)
-               VALUES (?, 'IT Support Specialist', 'Acme', ?, '/tmp/resume.pdf', ?, ?, ?, ?, ?, ?, ?)""",
+                                 agent_id, last_attempted_at, discovered_at,
+                                 eligibility_status, eligibility_version, eligibility_tier,
+                                 eligibility_reason)
+               VALUES (?, 'IT Support Specialist', 'Acme', ?, '/tmp/resume.pdf', ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, 'test')""",
             (url, app_url or url, score, status, attempts, applied_at, agent_id,
-             last_attempted_at, APPLIED_AT),
+             last_attempted_at, APPLIED_AT, elig, elig_version, tier),
         )
         self.conn.commit()
 
@@ -334,6 +338,51 @@ class AcquisitionTests(ApplySafetyTestCase):
             t.join(timeout=60)
         self.assertEqual(errors, [])
         self.assertEqual(sorted(claimed), sorted(f"{ATS}/{n}" for n in range(6)))
+
+
+class EligibilityGateTests(ApplySafetyTestCase):
+    def test_queue_only_returns_verified_eligible_jobs(self):
+        self.add_job(f"{ATS}/inel", score=10, elig="ineligible")
+        self.add_job(f"{ATS}/unk", score=10, elig="unknown")
+        self.add_job(f"{ATS}/restr", score=10, elig="restricted_remote")
+        self.add_job(f"{ATS}/none", score=10, elig=None, elig_version=None)
+        self.add_job(f"{ATS}/stale", score=10, elig="eligible_nc", elig_version="0.0.1")
+        self.assertIsNone(launcher.acquire_job())
+        self.add_job(f"{ATS}/ok", score=7, elig="eligible_us_remote")
+        self.assertEqual(launcher.acquire_job()["url"], f"{ATS}/ok")
+
+    def test_explicit_url_cannot_bypass_eligibility(self):
+        for status in ("ineligible", "unknown", "restricted_remote", "ineligible_manual"):
+            url = f"{ATS}/{status}"
+            self.add_job(url, elig=status)
+            with self.subTest(status=status):
+                self.assertIsNone(launcher.acquire_job(target_url=url))
+                self.assertIn(status, launcher.explain_target(url))
+
+    def test_manual_approval_allows_acquisition(self):
+        self.add_job(f"{ATS}/1", elig="unknown")
+        self.assertIsNone(launcher.acquire_job(target_url=f"{ATS}/1"))
+        eligibility.set_manual_decision(f"{ATS}/1", approve=True, conn=self.conn)
+        self.assertEqual(launcher.acquire_job(target_url=f"{ATS}/1")["url"], f"{ATS}/1")
+
+    def test_queue_prefers_commute_tier_over_score(self):
+        self.add_job(f"{ATS}/remote", score=9, elig="eligible_us_remote", tier="high")
+        self.add_job(f"{ATS}/mebane", score=7, elig="eligible_nc", tier="highest")
+        self.assertEqual(launcher.acquire_job()["url"], f"{ATS}/mebane")
+
+    def test_stage_queries_gate_scoring_and_tailoring(self):
+        for url, elig in ((f"{ATS}/e", "eligible_nc"), (f"{ATS}/u", "unknown"), (f"{ATS}/i", "ineligible")):
+            self.conn.execute("INSERT INTO jobs (url, title, full_description, eligibility_status, "
+                              "eligibility_version) VALUES (?, 't', 'd', ?, ?)",
+                              (url, elig, eligibility.CLASSIFIER_VERSION))
+        self.conn.commit()
+        pending_score = {j["url"] for j in database.get_jobs_by_stage(self.conn, "pending_score", limit=0)}
+        self.assertEqual(pending_score, {f"{ATS}/e", f"{ATS}/u"}, "ineligible jobs never reach the LLM")
+        self.conn.execute("UPDATE jobs SET fit_score = 9")
+        self.conn.commit()
+        pending_tailor = {j["url"] for j in database.get_jobs_by_stage(self.conn, "pending_tailor",
+                                                                      min_score=7, limit=0)}
+        self.assertEqual(pending_tailor, {f"{ATS}/e"}, "only verified-eligible jobs are tailored")
 
 
 class RetryAndRecoveryTests(ApplySafetyTestCase):

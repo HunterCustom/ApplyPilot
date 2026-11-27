@@ -130,8 +130,14 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     evidence_text = format_candidate_evidence(load_candidate_evidence())
     conn = get_connection()
 
+    # Deterministic geographic eligibility first: ineligible jobs never reach the LLM.
+    from applypilot.eligibility import SQL_NOT_INELIGIBLE, classify_jobs
+    classified = classify_jobs(conn)
+    if classified:
+        log.info("Eligibility classified %d jobs: %s", sum(classified.values()), classified)
+
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        query = f"SELECT * FROM jobs WHERE full_description IS NOT NULL AND {SQL_NOT_INELIGIBLE}"
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()

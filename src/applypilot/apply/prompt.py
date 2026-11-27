@@ -91,32 +91,42 @@ def _build_profile_summary(profile: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_location_check(profile: dict, search_config: dict) -> str:
+def accepted_onsite_cities(search_config: dict) -> list[str]:
+    """Onsite/hybrid cities from config: eligibility.commute_tiers, else legacy location_accept
+    (current key), else the old location.accept_patterns key."""
+    tiers = (search_config.get("eligibility") or {}).get("commute_tiers") or {}
+    cities = [str(c) for t in ("highest", "high", "acceptable") for c in (tiers.get(t) or [])]
+    if not cities:
+        cities = [str(c) for c in (search_config.get("location_accept")
+                                   or (search_config.get("location") or {}).get("accept_patterns") or [])]
+    return cities
+
+
+def _build_location_check(profile: dict, search_config: dict, job: dict | None = None) -> str:
     """Build the location eligibility check section of the prompt.
 
-    Uses the accept_patterns from search config to determine which cities
-    are acceptable for hybrid/onsite roles.
+    The job was already classified by the deterministic eligibility engine;
+    the agent only re-checks the live posting and stops on contradictions.
     """
     personal = profile["personal"]
-    location_cfg = search_config.get("location", {})
-    accept_patterns = location_cfg.get("accept_patterns", [])
-    primary_city = personal.get("city", location_cfg.get("primary", "your city"))
-
-    # Build the list of acceptable cities for hybrid/onsite
-    if accept_patterns:
-        city_list = ", ".join(accept_patterns)
-    else:
-        city_list = primary_city
+    cities = accepted_onsite_cities(search_config)
+    home_state = personal.get("province_state") or "the candidate's home state"
+    city_list = ", ".join(cities) if cities else personal.get("city", "the candidate's city")
+    job = job or {}
+    prescreen = ""
+    if job.get("eligibility_status"):
+        prescreen = (f"Pre-screen result: {job['eligibility_status']} "
+                     f"({job.get('eligibility_reason') or 'no reason recorded'}).\n")
 
     return f"""== LOCATION CHECK (do this FIRST before any form) ==
-Read the job page. Determine the work arrangement. Then decide:
-- "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in {city_list} -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in another city BUT the posting also says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
-- "Onsite only" or "hybrid only" in any city outside the list above with NO remote option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
-- City is overseas (India, Philippines, Europe, etc.) with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
-- Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly and let the system reject if needed.
-Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
+{prescreen}Read the live job page and confirm the work arrangement. The candidate lives in {personal.get('city', '')}, {home_state} and cannot relocate.
+- Onsite or hybrid in one of: {city_list} -> ELIGIBLE.
+- Remote open nationwide in the US, or remote with {home_state} explicitly allowed -> ELIGIBLE.
+- Remote limited to specific states/regions that do not include {home_state}, or "must reside in" another state -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- The page explicitly excludes {home_state} residents -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- Onsite or hybrid anywhere else, or outside the US -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- The word "remote" alone does not prove eligibility. If the page contradicts the pre-screen or you cannot tell -> output RESULT:FAILED:location_unclear and stop.
+Check EARLY, before filling any form."""
 
 
 def _build_salary_section(profile: dict) -> str:
@@ -287,7 +297,7 @@ def build_prompt(job: dict, tailored_resume: str,
 
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
-    location_check = _build_location_check(profile, search_config)
+    location_check = _build_location_check(profile, search_config, job)
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)

@@ -290,6 +290,15 @@ def status() -> None:
 
     console.print(summary)
 
+    if stats.get("eligibility"):
+        elig_table = Table(title="\nGeographic Eligibility", show_header=True, header_style="bold green")
+        elig_table.add_column("Classification")
+        elig_table.add_column("Count", justify="right")
+        for name, count in stats["eligibility"]:
+            elig_table.add_row(name, str(count))
+        console.print(elig_table)
+        console.print("[dim]Review undecided jobs with: applypilot eligibility[/dim]")
+
     # Score distribution
     if stats["score_distribution"]:
         dist_table = Table(title="\nScore Distribution", show_header=True, header_style="bold yellow")
@@ -323,6 +332,71 @@ def status() -> None:
         console.print(site_table)
 
     console.print()
+
+
+@app.command("eligibility")
+def eligibility_cmd(
+    status_filter: str | None = typer.Option(
+        None, "--status", "-s",
+        help="Show one classification (eligible_nc, eligible_us_remote, restricted_remote, unknown, "
+             "ineligible, eligible_manual, ineligible_manual). Default: the review queue."),
+    min_score: int = typer.Option(0, "--min-score", help="Only jobs with fit_score >= this."),
+    limit: int = typer.Option(30, "--limit", "-l", help="Rows to show (0 = all)."),
+    show_evidence: bool = typer.Option(False, "--evidence", "-e", help="Show supporting evidence."),
+    reclassify: bool = typer.Option(False, "--reclassify",
+                                    help="Re-run the classifier on all non-manual jobs."),
+    approve: str | None = typer.Option(None, "--approve", help="Mark a job URL eligible (human decision)."),
+    reject: str | None = typer.Option(None, "--reject", help="Mark a job URL ineligible (human decision)."),
+    note: str = typer.Option("", "--note", help="Reason recorded with --approve/--reject."),
+) -> None:
+    """Review deterministic geographic eligibility decisions."""
+    import json
+
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.eligibility import CLASSIFIER_VERSION, REVIEW_STATUSES, classify_jobs, set_manual_decision
+
+    if approve or reject:
+        url = approve or reject
+        if set_manual_decision(url, approve=bool(approve), note=note):
+            console.print(f"[green]Recorded manual {'approval' if approve else 'rejection'}:[/green] {url}")
+        else:
+            console.print(f"[red]No job with URL:[/red] {url}")
+            raise typer.Exit(code=1)
+        return
+
+    counts = classify_jobs(force=reclassify)
+    if counts:
+        console.print(f"Classified {sum(counts.values())} job(s) with classifier v{CLASSIFIER_VERSION}: {counts}")
+
+    conn = get_connection()
+    statuses = (status_filter,) if status_filter else REVIEW_STATUSES
+    placeholders = ",".join("?" * len(statuses))
+    sql = (f"SELECT url, title, site, location, fit_score, eligibility_status, eligibility_reason, "
+           f"eligibility_evidence FROM jobs WHERE eligibility_status IN ({placeholders}) "
+           f"AND COALESCE(fit_score, 0) >= ? ORDER BY fit_score DESC NULLS LAST, url")
+    params: list = [*statuses, min_score]
+    if limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+
+    table = Table(title=f"Eligibility: {', '.join(statuses)}", show_header=True, header_style="bold cyan")
+    for col, kw in (("Score", {"justify": "right"}), ("Title", {}), ("Employer", {}), ("Location", {}),
+                    ("Class", {}), ("Reason", {})):
+        table.add_column(col, **kw)
+    for r in rows:
+        table.add_row(str(r["fit_score"] if r["fit_score"] is not None else "-"), (r["title"] or "")[:40],
+                      (r["site"] or "")[:18], (r["location"] or "-")[:28], r["eligibility_status"],
+                      (r["eligibility_reason"] or "")[:70])
+    console.print(table)
+    if show_evidence:
+        for r in rows:
+            console.print(f"\n[bold]{(r['title'] or '')[:60]}[/bold]  {r['url']}")
+            for ev in json.loads(r["eligibility_evidence"] or "[]"):
+                console.print(f"  - {ev}")
+    console.print("[dim]Approve: applypilot eligibility --approve URL --note '...'  |  "
+                  "Reject: --reject URL[/dim]")
 
 
 @app.command()

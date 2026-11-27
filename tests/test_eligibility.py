@@ -187,6 +187,20 @@ class ConfigTests(unittest.TestCase):
         cfg = eligibility.load_eligibility_config({"location_accept": ["Burlington, NC", "Durham", "NC"]})
         self.assertEqual(cfg.tiers["acceptable"], ["Burlington", "Durham"])
 
+    def test_apply_prompt_reads_current_config_keys(self):
+        from applypilot.apply.prompt import _build_location_check, accepted_onsite_cities
+        self.assertEqual(accepted_onsite_cities({"location_accept": ["Mebane", "Graham"]}), ["Mebane", "Graham"])
+        self.assertEqual(accepted_onsite_cities({"location": {"accept_patterns": ["Durham"]}}), ["Durham"])
+        self.assertEqual(accepted_onsite_cities({"eligibility": {"commute_tiers": {"highest": ["Whitsett"]}},
+                                                 "location_accept": ["Ignored"]}), ["Whitsett"])
+        text = _build_location_check({"personal": {"city": "Town", "province_state": "NC"}},
+                                     {"location_accept": ["Mebane"]},
+                                     {"eligibility_status": "eligible_nc", "eligibility_reason": "tier"})
+        self.assertIn("Mebane", text)
+        self.assertIn("Pre-screen result: eligible_nc", text)
+        self.assertNotIn('"Remote" or "work from anywhere" -> ELIGIBLE', text)
+        self.assertIn('"remote" alone does not prove eligibility', text)
+
     def test_home_state_from_profile(self):
         cfg = eligibility.load_eligibility_config({}, {"personal": {"province_state": "North Carolina"}})
         self.assertEqual(cfg.home_state, "NC")
