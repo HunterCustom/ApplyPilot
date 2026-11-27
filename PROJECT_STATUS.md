@@ -1,6 +1,29 @@
 # Project Status
 
-_Audit date: 2026-11-27 · Branch `feature/claude-development` @ `81c13b8` · Fork is level with `upstream/main` (4a8d521) plus 18 fork commits (~500 lines, scoring only)._
+_Audit date: 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81c13b8` · Fork is level with `upstream/main` (4a8d521) plus fork commits._
+
+## Phase 0 result (2026-11-27) — DONE, verified by tests
+| Item | Status |
+|---|---|
+| Dry run never records `applied` / `applied_at`; launcher enforces even if agent says APPLIED | Fixed (`021d9a4`) |
+| Dry run status `dry_run`, no retry attempts consumed, job re-eligible for real runs | Fixed |
+| `apply --url` with NULL status; applied / in_progress / needs_review never acquired | Fixed |
+| Duplicate guard on shared `application_url` | Added (URL-level only; company/title dedupe is Phase 3) |
+| Concurrent acquisition (8 threads, 6 jobs → 6 unique claims) | Verified |
+| Manual-ATS skip continues to next job | Fixed |
+| Uncertain outcomes (no/conflicting RESULT, timeout, watchdog, Ctrl+C after agent start, launcher error) → `needs_review`, not retried; `--reset-failed` leaves them alone | Added |
+| Stale `in_progress` locks recovered at `apply` start (dry → released, real → needs_review) | Added |
+| Hung agent watchdog (`APPLYPILOT_APPLY_MAX_SECONDS`, default 1200 s) | Added |
+| `status` shows dry-run and needs-review counts | Added |
+| Dev `.env` duplicate `LLM_MODEL` | Resolved (backup `.env.backup-20261127-132213` in dev dir) |
+| Effective LLM: Local `http://127.0.0.1:1234/v1`, model `qwen/qwen3-14b` (confirmed in `/v1/models`, test inference returned `OK` in 8.2 s) | Verified |
+| `doctor` reports effective provider/model, checks model is served, warns on ignored keys | Fixed (`b811031`) |
+| Tests | 35/35 pass (22 apply-safety + 4 provider + 9 existing); new test files lint-clean; no new ruff findings in modified source files |
+
+Resolving a `needs_review` job: check the employer portal / email, then `applypilot apply --mark-applied URL`
+or `--mark-failed URL` (then `--reset-failed` to requeue).
+
+_The audit findings below are kept as the original baseline; items 1, 2, 4, 5 are resolved by Phase 0._
 
 ## Dev data snapshot (`~/.applypilot-dev`, read-only inspection)
 | Metric | Value |
@@ -42,3 +65,26 @@ Source mix is dominated by upstream's default `employers.yaml` (Thomson Reuters,
 - Claude Code 2.1.332 (also the apply agent), Node 24 / npx (Playwright MCP), Chrome, uv, ripgrep, git. `gh` not installed.
 - MCP: context-mode (`ctx_execute`/`ctx_search` for large outputs), RTK output condensing, Serena ×3 + graphify ×3 (all bound to unrelated projects), Claude in Chrome / built-in browser (for manual verification only).
 - `.serena/` — local Serena cache + Codex-era memories with machine paths → now gitignored.
+
+### Dedicated Serena for ApplyPilot (investigated, not yet enabled)
+Existing user-scope servers (`serena-victory`, `serena-xcl`, `serena-fxceless`, `graphify-*`) are pinned to
+`F:\` projects and must stay untouched. ApplyPilot is already registered in `~/.serena/serena_config.yml`
+and has `.serena/project.yml`. Add a **project-scoped** server in `ApplyPilot-Dev/.mcp.json`
+(already gitignored by `.mcp*.json`); Claude Code asks for approval on next start:
+```json
+{"mcpServers": {"serena-applypilot": {
+  "command": "C:\\Users\\Hunter\\.local\\bin\\serena.exe",
+  "args": ["start-mcp-server", "--project", "C:\\Users\\Hunter\\ApplyPilot-Dev", "--context", "claude-code",
+           "--agent-interface", "tools", "--transport", "stdio", "--open-web-dashboard", "false"]}}}
+```
+Graphify: optional, low value for a ~10k-line repo. It would need a graph built into `graphify-out/`
+(via the graphify skill), then `graphify-mcp.exe --graph <repo>\graphify-out\graph.json` in the same `.mcp.json`;
+`graphify-out/` would need gitignoring.
+
+## Remaining safety risks (post Phase 0)
+- **No hard eligibility gate** (Phase 2): the apply prompt still treats any "Remote" as eligible and ignores `location_accept`.
+- **CAPTCHA wording in apply prompt**: the prompt tells the agent to "solve" CAPTCHAs and includes a CapSolver path when `CAPSOLVER_API_KEY` is set (it is not set). This conflicts with the no-bypass constraint; must be changed to detect-and-stop before any browser test (Phase 5 prerequisite).
+- Agent runs with `--permission-mode bypassPermissions` and a Gmail MCP (read access to the mailbox for verification codes); destructive Gmail tools are disallowed.
+- Profile password in the apply prompt and full agent transcripts written to `logs/`.
+- Duplicate detection is URL-based only; the same role under different URLs can still be applied to twice (Phase 3).
+- `needs_review` resolution is manual and there is no dedicated CLI listing yet (`status` shows the count).

@@ -5,8 +5,10 @@ NC / US-remote IT support & infrastructure roles. Origin: `HunterCustom/ApplyPil
 Status and plan live in `PROJECT_STATUS.md` and `DEVELOPMENT_ROADMAP.md` — read those first.
 
 ## Hard rules
-- **Never submit real applications during development.** Only `applypilot apply --dry-run`
-  (and only after the dry-run status bug in `PROJECT_STATUS.md` is fixed).
+- **Never submit real applications during development.** Only `applypilot apply --dry-run`,
+  and no browser-based apply tests until the CAPTCHA prompt fix (roadmap Phase 5 prerequisite).
+- Apply status lifecycle is documented at the top of the DB section in `apply/launcher.py`.
+  Never weaken: dry runs never set `applied`/`applied_at`; uncertain outcomes → `needs_review`, never auto-retried.
 - **Always set `APPLYPILOT_DIR` to the dev dir before importing the package**:
   `$env:APPLYPILOT_DIR = "$HOME\.applypilot-dev"`. `config.APP_DIR` is resolved at import time.
   `~\.applypilot` is PRODUCTION data — never read-write it, never point tools at it.
@@ -22,13 +24,15 @@ Status and plan live in `PROJECT_STATUS.md` and `DEVELOPMENT_ROADMAP.md` — rea
 ## Commands (PowerShell, repo root)
 ```powershell
 $env:APPLYPILOT_DIR = "$HOME\.applypilot-dev"
-.\.venv\Scripts\python.exe -m pytest tests/ -q          # 9 tests, all unittest-style
-.\.venv\Scripts\python.exe -m ruff check src/            # CI step; currently 147 pre-existing findings
+.\.venv\Scripts\python.exe -m pytest tests/ -q          # 35 tests, unittest-style, temp DBs only
+.\.venv\Scripts\python.exe -m ruff check <changed files> # repo-wide ruff has ~147 pre-existing findings; don't add new ones
 .\.venv\Scripts\applypilot.exe doctor                    # read-only setup check
 .\.venv\Scripts\applypilot.exe status                    # pipeline counts
 .\.venv\Scripts\applypilot.exe run score --limit 20      # stages: discover enrich score tailor cover pdf
 ```
-Python 3.13 venv at `.venv`. Local LLM: LM Studio at `http://127.0.0.1:1234/v1` (qwen/qwen3-14b).
+Python 3.13 venv at `.venv`. Default LLM: local LM Studio at `http://127.0.0.1:1234/v1`, model `qwen/qwen3-14b`
+(LM Studio must be running with it loaded; `doctor` verifies). Tests that touch the DB must patch
+`applypilot.database.DB_PATH` to a temp file and `atexit.unregister(chrome.cleanup_on_exit)` — see `tests/test_apply_safety.py`.
 
 ## Architecture (src/applypilot)
 - `cli.py` (Typer) → `pipeline.py` runs stages; `apply/launcher.py` is separate.
@@ -47,6 +51,7 @@ Python 3.13 venv at `.venv`. Local LLM: LM Studio at `http://127.0.0.1:1234/v1` 
 ## Tooling notes
 - Output from shell/Read is condensed by RTK/context-mode. Use `ctx_execute` to compute answers
   over large data; use `Read` with `offset/limit` for source files; `rtk bypass` only if output is unusable.
-- Serena MCP servers in this environment are bound to other projects (`activate_project` disabled);
-  use Grep/Read here. `.serena/` is local-only and gitignored.
+- User-scope Serena/Graphify servers belong to other projects (F:\ drive) — never modify them.
+  A project-scoped `serena-applypilot` config is in `PROJECT_STATUS.md`; until enabled use Grep/Read.
+  `.serena/` is local-only and gitignored.
 - `gh` CLI is not installed; use git + the GitHub web UI for PRs.

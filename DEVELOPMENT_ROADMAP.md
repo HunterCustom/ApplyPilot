@@ -4,18 +4,16 @@ Goal: supervised, then largely autonomous, applications to eligible NC / US-remo
 with no fabricated qualifications, no duplicate submissions, and no CAPTCHA/access bypass.
 Each phase ends with tests passing and a review checkpoint. Estimates are focused working sessions.
 
-## Phase 0 — Apply-tracking safety (≈0.5 session) ← START HERE
-- Dry run: agent emits `RESULT:DRY_RUN` (or launcher maps APPLIED→`dry_run` when `dry_run=True`); store `apply_status='dry_run'`, never `applied`, never touch `applied_at`. Dry-run rows stay re-queueable.
-- Fix `acquire_job(target_url)`: `(apply_status IS NULL OR apply_status NOT IN ('in_progress','applied'))`.
-- Manual-ATS skip continues to the next job instead of ending the worker.
-- Unit tests with a temp `APPLYPILOT_DIR` SQLite DB (no browser, no LLM).
+## Phase 0 — Apply-tracking safety ✅ DONE 2026-11-27 (`021d9a4`)
+Dry-run status, target-URL fix, applied/review never re-acquired, application-URL duplicate guard,
+manual-ATS continue, uncertain → `needs_review`, stale-lock recovery, watchdog. 22 regression tests.
 
-## Phase 1 — Config hygiene (≈0.25 session, user + Claude)
-- User fixes dev `.env`: single `LLM_MODEL` (local `qwen/qwen3-14b` or Gemini without `LLM_URL`).
-- `doctor` reports the *effective* provider/model (LLM_URL precedence).
-- Record model name with each score (e.g. in `score_reasoning` header) for traceability.
+## Phase 1 — Config hygiene ✅ DONE 2026-11-27 (`b811031`)
+- Dev `.env` resolved to local `qwen/qwen3-14b`; `doctor` reports effective provider/model and checks it is served.
+- Still open (fold into Phase 4): record the model name with each score for traceability.
 
-## Phase 2 — Hard eligibility gate (≈1 session)
+## Phase 2 — Hard eligibility gate (≈1 session) ← NEXT
+- Prerequisite quick fix: apply prompt reads `location_accept` (current key) and remote is only eligible when not restricted to states excluding NC.
 - Deterministic `eligibility.py`: classify each job `eligible_nc | eligible_us_remote | restricted_remote | ineligible | unknown` from location + description (state lists, "must reside in", "Remote – <state>", international, title-embedded cities).
 - Config from `priority.yaml` / `searches.yaml` (`location_accept`); fix prompt to read `location_accept`.
 - Gate tailoring and apply on `eligible_*`; `unknown` → manual review list, not auto-apply.
@@ -33,6 +31,8 @@ Each phase ends with tests passing and a review checkpoint. Estimates are focuse
 - Add a test that tailored output contains no skill outside resume ∪ evidence.
 
 ## Phase 5 — Supervised dry-run applications (≈1 session)
+- Prerequisite: replace the apply prompt's CAPTCHA "solve" / CapSolver instructions with detect → `RESULT:CAPTCHA` → stop.
+- Add `applypilot apply --review` (list `needs_review` jobs with error + log path).
 - `applypilot apply --dry-run --url <job>` on 3–5 jobs across ATS types (Workday, Ashby, ADP, Greenhouse, PeopleAdmin), visible Chrome, watching.
 - Review agent logs; tune prompt for screening questions; confirm `dry_run` status and no submission.
 - Redact profile password from saved logs.
@@ -46,4 +46,4 @@ Each phase ends with tests passing and a review checkpoint. Estimates are focuse
 - Scheduled discover→enrich→score→tailor; daily review digest; follow-up tracking.
 - Ruff cleanup so CI is green (low priority; do incrementally in touched files).
 
-**Estimate to supervised real submission (end of Phase 5): ~4–5 working sessions.**
+**Estimate to supervised real submission (end of Phase 5): ~3.5–4 working sessions remaining after Phase 0/1.**
