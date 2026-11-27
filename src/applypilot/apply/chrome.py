@@ -228,37 +228,10 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
-def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
-    """Launch a Chrome instance with remote debugging for a worker.
-
-    Args:
-        worker_id: Numeric worker identifier.
-        port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
-        headless: Run Chrome in headless mode (no visible window).
-
-    Returns:
-        subprocess.Popen handle for the Chrome process.
-    """
-    if port is None:
-        port = BASE_CDP_PORT + worker_id
-
-    # Exclusive slot first: only then is a Chrome on this port/profile provably a leftover of ours.
-    acquire_worker_slot(worker_id)
-    profile_dir = setup_worker_profile(worker_id)
-
-    # Kill a leftover ApplyPilot Chrome from a previous run on this port (never anything else)
-    if not _kill_on_port(port):
-        raise RuntimeError(
-            f"CDP port {port} is in use by a process that is not ApplyPilot Chrome; "
-            "refusing to terminate it. Free the port and retry."
-        )
-
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
-
-    chrome_exe = config.get_chrome_path()
-
+def chrome_command(chrome_exe: str, port: int, profile_dir: Path, headless: bool,
+                   proxy_port: int | None) -> list[str]:
+    """Worker Chrome command line. ``proxy_port`` (the launcher's egress proxy) is
+    mandatory for apply sessions; ``None`` is only for callers that never browse."""
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
@@ -283,8 +256,50 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--deny-permission-prompts",
         "--disable-notifications",
     ]
+    if proxy_port is not None:
+        from applypilot.apply.network_guard import chrome_network_args
+        cmd += chrome_network_args(proxy_port)
     if headless:
         cmd.append("--headless=new")
+    return cmd
+
+
+def launch_chrome(worker_id: int, port: int | None = None,
+                  headless: bool = False, proxy_port: int | None = None) -> subprocess.Popen:
+    """Launch a Chrome instance with remote debugging for a worker.
+
+    Args:
+        worker_id: Numeric worker identifier.
+        port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
+        headless: Run Chrome in headless mode (no visible window).
+        proxy_port: The launcher's egress proxy (``NetworkGuard.proxy_port``); all
+            browser traffic is routed through it.
+
+    Returns:
+        subprocess.Popen handle for the Chrome process.
+    """
+    if port is None:
+        port = BASE_CDP_PORT + worker_id
+
+    # Exclusive slot first: only then is a Chrome on this port/profile provably a leftover of ours.
+    acquire_worker_slot(worker_id)
+    profile_dir = setup_worker_profile(worker_id)
+
+    # Kill a leftover ApplyPilot Chrome from a previous run on this port (never anything else)
+    if not _kill_on_port(port):
+        raise RuntimeError(
+            f"CDP port {port} is in use by a process that is not ApplyPilot Chrome; "
+            "refusing to terminate it. Free the port and retry."
+        )
+
+    # Patch preferences to suppress restore nag
+    _suppress_restore_nag(profile_dir)
+
+    chrome_exe = config.get_chrome_path()
+
+    from applypilot.apply.network_guard import disable_external_protocols
+    disable_external_protocols(profile_dir)
+    cmd = chrome_command(chrome_exe, port, profile_dir, headless, proxy_port)
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

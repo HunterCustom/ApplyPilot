@@ -165,12 +165,23 @@ def apply(
 ) -> None:
     """Launch auto-apply to submit job applications."""
     if approve:
-        # Human-only path: grants exactly one pending submit request (matched by nonce).
+        # Human-only path: grants exactly one pending, unexpired request (matched by nonce).
+        # The grant is single-use and bound to this job, session and exact action.
+        from pathlib import Path
+
+        from applypilot.apply import approval
         from applypilot.apply.policy import approve_submission
-        if not nonce or not approve_submission(approve, nonce):
-            console.print("[red]No matching pending submission request.[/red]")
+        req = approval.pending_request(Path(approve), nonce or "")
+        if req:
+            action = req.get("action") or {}
+            console.print(f"[bold]Approving {req.get('kind')} action[/bold] for job {req.get('job_url')}")
+            for key in ("method", "url", "resource_type", "body_len", "tool_action"):
+                if key in action:
+                    console.print(f"  {key}: {str(action[key])[:200]}")
+        if not nonce or not req or not approve_submission(approve, nonce):
+            console.print("[red]No matching pending (unexpired, unused) submission request.[/red]")
             raise typer.Exit(code=1)
-        console.print("[green]Submission approved for this one request.[/green]")
+        console.print("[green]Approved for this one request only.[/green]")
         return
 
     _bootstrap()

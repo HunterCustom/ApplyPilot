@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from applypilot import config
-from applypilot.apply import chrome, launcher, policy_hook
+from applypilot.apply import approval, chrome, launcher, policy_hook
 from applypilot.apply import policy as P
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply import verification_mcp as V
@@ -41,11 +41,36 @@ PROFILE = {
 }
 
 
-def make_policy(tmp, dry_run=True, **kw):
+def mark_guard_verified(session_dir):
+    """What NetworkGuard.activate writes after its self-test (see test_network_boundary)."""
+    (Path(session_dir) / P.GUARD_STATUS_FILE).write_text(json.dumps({"active": True, "selftest": "ok"}))
+
+
+def make_policy(tmp, dry_run=True, guard_verified=True, **kw):
+    kw.setdefault("job_url", JOB["url"])
     pol = P.SessionPolicy(session_dir=str(tmp), dry_run=dry_run, allowed_hosts=P.session_allowed_hosts(JOB),
                           upload_paths=[str(Path(tmp) / "uploads" / "Testy_Resume.pdf")], **kw)
     pol.write()
+    if guard_verified:
+        mark_guard_verified(tmp)
     return pol
+
+
+class FakeGuard:
+    """Stands in for NetworkGuard in run_job tests (the real one is tested with Chrome)."""
+
+    def __init__(self, fail_activate=None):
+        self.failed = threading.Event()
+        self.failure_reason = ""
+        self.on_failure = self.on_approval_request = None
+        self.fail_activate = fail_activate
+        self.activated = False
+
+    def activate(self, policy, port):
+        if self.fail_activate:
+            raise launcher.NetworkGuardError(self.fail_activate)
+        self.activated = True
+        mark_guard_verified(policy.dir)
 
 
 class TempDirCase(unittest.TestCase):
@@ -265,12 +290,13 @@ class SubmitApprovalTests(TempDirCase):
         event = {"tool_name": PW + "browser_click", "tool_input": {"element": "Submit application"}}
 
         def approve():
-            req = P.approval_request_path(self.tmp)
             for _ in range(200):
-                if req.exists():
-                    nonce = json.loads(req.read_text())["nonce"]
-                    self.assertFalse(P.approve_submission(self.tmp, "wrong-nonce"))
-                    self.assertTrue(P.approve_submission(self.tmp, nonce))
+                reqs = list((self.tmp / approval.APPROVAL_DIR).glob("req-*.json"))
+                if reqs:
+                    req = json.loads(reqs[0].read_text())
+                    self.assertEqual((req["kind"], req["job_url"]), ("click", JOB["url"]))
+                    self.assertFalse(P.approve_submission(self.tmp, "0" * 32))
+                    self.assertTrue(P.approve_submission(self.tmp, req["nonce"]))
                     return
                 time.sleep(0.05)
 
@@ -283,6 +309,9 @@ class SubmitApprovalTests(TempDirCase):
         with mock.patch("sys.stdout", io.StringIO()):
             policy_hook.handle_post(pol, {"tool_name": PW + "browser_click",
                                           "tool_response": "Thank you for applying! - Page URL: https://careers.acme-corp.com/done"})
+        # the click approval alone is not evidence: the network guard must also have released the request
+        self.assertEqual(launcher.submission_evidence(self.tmp), (False, True))
+        P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True})
         self.assertEqual(launcher.submission_evidence(self.tmp), (True, True))
 
 
@@ -312,10 +341,15 @@ class CliSubmissionGateTests(TempDirCase):
         self.assertTrue(self.invoke(["--allow-real-submissions"])[1].called)
 
     def test_approve_requires_matching_nonce(self):
-        P.approval_request_path(self.tmp).write_text(json.dumps({"nonce": "abc"}))
-        self.assertEqual(self.invoke(["--approve", str(self.tmp), "--nonce", "zzz"])[0].exit_code, 1)
-        self.assertEqual(self.invoke(["--approve", str(self.tmp), "--nonce", "abc"])[0].exit_code, 0)
-        self.assertTrue((self.tmp / "approval-grant-abc.json").exists())
+        req = approval.create_request(self.tmp, kind="network", job_url=JOB["url"],
+                                      action={"method": "POST"}, ttl_s=60)
+        self.assertEqual(self.invoke(["--approve", str(self.tmp), "--nonce", "f" * 32])[0].exit_code, 1)
+        result = self.invoke(["--approve", str(self.tmp), "--nonce", req["nonce"]])[0]
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("POST", result.output)  # the human sees the exact action being approved
+        self.assertTrue((self.tmp / approval.APPROVAL_DIR / f"grant-{req['nonce']}.json").exists())
+        # single use: a second grant of the same nonce is refused
+        self.assertEqual(self.invoke(["--approve", str(self.tmp), "--nonce", req["nonce"]])[0].exit_code, 1)
 
 
 # --- Classification / lifecycle (Task A + E) -----------------------------------------
@@ -576,7 +610,7 @@ class FakeProc:
 
 class RunJobTests(TempDirCase):
 
-    def run_job(self, lines, setup=None):
+    def run_job(self, lines, setup=None, guard=None):
         app = self.tmp / "app"
         logs = app / "logs"
         logs.mkdir(parents=True)
@@ -600,9 +634,43 @@ class RunJobTests(TempDirCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        result, _ = launcher.run_job(dict(JOB), port=9999, worker_id=5, dry_run=True)
+        self.popen_calls = popen
+        self.guard = guard or FakeGuard()
+        result, _ = launcher.run_job(dict(JOB), port=9999, worker_id=5, dry_run=True,
+                                     guard=self.guard)  # pyright: ignore[reportArgumentType]
         log_text = "".join(f.read_text(encoding="utf-8") for f in logs.iterdir())
         return result, killed, log_text
+
+    def test_no_guard_never_starts_agent(self):
+        with mock.patch.object(launcher.subprocess, "Popen") as popen:
+            result, _ = launcher.run_job(dict(JOB), port=9999, worker_id=5, dry_run=True)
+        self.assertEqual(result, "failed:network_guard_unavailable")
+        popen.assert_not_called()
+
+    def test_guard_verification_failure_never_starts_agent(self):
+        started = []
+        result, _killed, _ = self.run_job([dict(InitEventTests.GOOD)], setup=started.append,
+                                         guard=FakeGuard(fail_activate="interception not active"))
+        self.assertEqual(result, "failed:network_guard_unavailable")
+        self.assertEqual(started, [])  # Popen (and so the agent) was never reached
+
+    def test_guard_failure_mid_session_kills_agent_and_needs_review(self):
+        guard = FakeGuard()
+
+        def setup(session):
+            (session / "hook_alive").write_text("1")
+            pol = P.SessionPolicy.load(session / "policy.json")
+            P.record_audit(pol, {"phase": "pre", "tool": PW + "browser_navigate", "decision": "allow"})
+            # the guard loses enforcement while the agent runs
+            (session / P.GUARD_FAILED_FILE).write_text("lost CDP")
+            guard.failed.set()
+
+        tool = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": PW + "browser_navigate", "input": {"url": JOB["application_url"]}}]}}
+        result, killed, _ = self.run_job([dict(InitEventTests.GOOD), tool,
+                                          {"type": "result", "result": "RESULT:DRY_RUN"}], setup, guard)
+        self.assertEqual(result, "uncertain:network_guard_failed")
+        self.assertIn(424242, killed)
 
     def test_unexpected_tool_surface_kills_session(self):
         bad = {**InitEventTests.GOOD, "tools": InitEventTests.GOOD["tools"] + ["Bash"]}

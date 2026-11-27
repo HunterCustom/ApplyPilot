@@ -4,10 +4,11 @@ The launcher passes this hook to the apply agent only in dry-run mode
 (``--settings``). Claude Code runs it before every tool call; exit code 2
 blocks the call and returns the stderr message to the agent.
 
-This is a best-effort, tool-level safeguard, not a guarantee: it can only
-judge what the tool input says. A click whose ``element`` description does
-not reveal that it submits (e.g. a button labelled "Continue" that actually
-submits) cannot be recognised. Dry runs therefore still require supervision.
+This is a best-effort, tool-level safeguard: it can only judge what the tool
+input says, so a button labelled "Continue" that actually submits is not
+recognised here. The label-free boundary is the launcher's NetworkGuard
+(``network_guard.py``), which fails every state-changing request in dry runs
+before it is sent. This hook remains as an additional layer.
 """
 import json
 import re

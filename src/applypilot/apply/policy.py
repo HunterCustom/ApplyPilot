@@ -10,7 +10,9 @@ Session files (all inside the session directory, never shown to the agent):
   audit.jsonl      one record per hook decision (tool name + decision, no values)
   violations.jsonl policy blocks; any entry turns the job into needs_review
   hook_alive       written by the SessionStart hook (proves hooks are active)
-  approval-*.json  real-run submission approval requests / grants (see approve_submission)
+  approvals/       single-use, expiring approval requests / grants (see approval.py)
+  network-guard.json / network-guard-failed / dry-run-boundary.json / network.jsonl
+                   written by the launcher's NetworkGuard (see network_guard.py)
 """
 from __future__ import annotations
 
@@ -244,6 +246,9 @@ class SessionPolicy:
     trusted_hosts: list[str] = field(default_factory=list)  # tests / trusted local infra only
     require_submit_approval: bool = True  # real runs: submit-like clicks wait for a human grant
     approval_timeout_s: int = 600
+    job_url: str = ""  # approvals are bound to this job + this session directory
+    asset_hosts: list[str] = field(default_factory=list)  # GET-only static subresource hosts
+    require_network_guard: bool = True  # hooks deny every tool unless the launcher's guard is verified
 
     @property
     def dir(self) -> Path:
@@ -291,21 +296,35 @@ def session_halted(policy: SessionPolicy) -> bool:
     return any(v.get("terminal") or v.get("corrupt") for v in read_jsonl(policy.dir / "violations.jsonl"))
 
 
+# --- Launcher network guard state (Phase 3b) -------------------------------------
+# Written only by the launcher's NetworkGuard (never reachable by the agent or page).
+GUARD_STATUS_FILE = "network-guard.json"     # {"active": true, "selftest": "ok", ...}
+GUARD_FAILED_FILE = "network-guard-failed"   # enforcement lost mid-session
+DRY_RUN_BOUNDARY_FILE = "dry-run-boundary.json"  # the page tried to transmit data in a dry run
+
+
+def network_guard_problem(policy: SessionPolicy) -> str | None:
+    """Why the launcher's network boundary cannot be trusted for this session, or None."""
+    if not policy.require_network_guard:
+        return None
+    if (policy.dir / GUARD_FAILED_FILE).exists():
+        return "the launcher network guard failed"
+    try:
+        status = json.loads((policy.dir / GUARD_STATUS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "the launcher network guard is not active"
+    if not (isinstance(status, dict) and status.get("active") is True and status.get("selftest") == "ok"):
+        return "the launcher network guard was not verified"
+    return None
+
+
+def dry_run_boundary_reached(policy: SessionPolicy) -> bool:
+    return policy.dry_run and (policy.dir / DRY_RUN_BOUNDARY_FILE).exists()
+
+
 # --- Real-run submission approval (trusted controller) --------------------------
 
-def approval_request_path(session_dir: Path) -> Path:
-    return session_dir / "approval-request.json"
-
-
 def approve_submission(session_dir: str | Path, nonce: str) -> bool:
-    """Human grant for one pending submit request (called from the CLI, never by the agent)."""
-    session_dir = Path(session_dir)
-    req = approval_request_path(session_dir)
-    if not req.exists():
-        return False
-    data = json.loads(req.read_text(encoding="utf-8"))
-    if data.get("nonce") != nonce:
-        return False
-    (session_dir / f"approval-grant-{nonce}.json").write_text(
-        json.dumps({"nonce": nonce, "t": time.time()}), encoding="utf-8")
-    return True
+    """Human grant for one pending, unexpired request (CLI only, never the agent)."""
+    from applypilot.apply import approval
+    return approval.grant(Path(session_dir), nonce)

@@ -27,7 +27,8 @@ from rich.live import Live
 from applypilot import config, eligibility
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, dry_run_guard, prompt as prompt_mod
-from applypilot.apply import policy as policy_mod, verification_mcp
+from applypilot.apply import network_policy, policy as policy_mod, verification_mcp
+from applypilot.apply.network_guard import NetworkGuard, NetworkGuardError
 from applypilot.apply.redact import Redactor
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -743,15 +744,31 @@ def audit_session(session_dir: Path, tool_uses: int) -> str | None:
         return "uncertain:policy_hook_not_active"
     if pre < tool_uses:
         return "uncertain:policy_hook_not_enforced"
+    if (session_dir / policy_mod.GUARD_FAILED_FILE).exists():
+        return "uncertain:network_guard_failed"
+    if tool_uses and not _guard_verified(session_dir):
+        return "uncertain:network_guard_not_verified"
     if violations:
         return "uncertain:policy_violation"
     return None
 
 
+def _guard_verified(session_dir: Path) -> bool:
+    try:
+        status = json.loads((session_dir / policy_mod.GUARD_STATUS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(status, dict) and status.get("active") is True and status.get("selftest") == "ok"
+
+
 def submission_evidence(session_dir: Path) -> tuple[bool, bool]:
-    """(a human approved a submit action, confirmation text was seen after it)."""
+    """(a human approved the submit click AND the request it sent, confirmation text was seen).
+
+    The click approval comes from the policy hook, the request approval from the
+    launcher's network guard: a submission the guard never released cannot count."""
     audit = policy_mod.read_jsonl(session_dir / "audit.jsonl")
-    approved = any(r.get("submit_approved") for r in audit)
+    approved = (any(r.get("submit_approved") for r in audit)
+                and any(r.get("net_approved") for r in audit))
     confirmed = any(r.get("evidence") == "confirmation_text" for r in audit)
     return approved, confirmed
 
@@ -790,18 +807,27 @@ def build_session_policy(job: dict, session: Path, dry_run: bool,
         session_dir=str(session), dry_run=dry_run, allowed_hosts=hosts, upload_paths=uploads,
         verify_enabled=verify_enabled, verify_sender_domains=sender_domains,
         require_submit_approval=not dry_run,
+        job_url=job["url"], asset_hosts=list(network_policy.STATIC_ASSET_HOSTS),
+        require_network_guard=True,
     )
 
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
+            model: str = "sonnet", dry_run: bool = False,
+            guard: NetworkGuard | None = None) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
+
+    ``guard`` is the launcher's network boundary for the Chrome on ``port``
+    (started before Chrome, see worker_loop). Without a verified guard the
+    agent is never started.
     """
+    if guard is None:
+        return "failed:network_guard_unavailable", 0
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -860,6 +886,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     agent_launched = False
 
     try:
+        try:
+            guard.on_approval_request = lambda req: add_event(
+                f"[W{worker_id}] APPROVAL NEEDED: applypilot apply --approve {session} --nonce {req['nonce']}")
+            guard.activate(policy, port)  # fail closed: raises unless both layers are verified
+        except NetworkGuardError as e:
+            add_event(f"[W{worker_id}] Network guard unavailable: {str(e)[:40]}")
+            update_state(worker_id, status="failed", last_action="network guard unavailable")
+            return "failed:network_guard_unavailable", int((time.time() - start) * 1000)
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -879,6 +913,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _on_watchdog(p=proc):
             watchdog_fired.set()
             _kill_process_tree(p.pid)
+
+        guard.on_failure = lambda p=proc: _kill_process_tree(p.pid)  # enforcement lost -> stop now
+        if guard.failed.is_set():
+            _kill_process_tree(proc.pid)
 
         watchdog = threading.Timer(APPLY_MAX_SECONDS, _on_watchdog)
         watchdog.daemon = True
@@ -1134,12 +1172,16 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             _agent_started.discard(worker_id)
 
         chrome_proc = None
+        guard = None
         try:
+            # The network guard (egress proxy) exists before Chrome, so Chrome never has a direct route.
+            guard = NetworkGuard()
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
+                                        proxy_port=guard.proxy_port)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+                                            model=model, dry_run=dry_run, guard=guard)
 
             outcome = record_outcome(job["url"], result, dry_run=dry_run,
                                      duration_ms=duration_ms, owner=job["agent_id"])
@@ -1171,6 +1213,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         finally:
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
+            if guard is not None:
+                guard.stop()  # after Chrome is gone: the browser never outlives its boundary
 
         jobs_done += 1
         if target_url:

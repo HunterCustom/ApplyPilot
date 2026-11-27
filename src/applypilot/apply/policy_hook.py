@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import json
 import re
-import secrets
 import sys
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from applypilot.apply import dry_run_guard
+from applypilot.apply import approval, dry_run_guard
 from applypilot.apply import policy as P
 
 GUARD_PREFIX = "DRY RUN GUARD"  # launcher recognises dry-run guard blocks by this text
@@ -58,6 +57,12 @@ def decide_pre(policy: P.SessionPolicy, tool_name: str, tool_input: dict) -> tup
     """Return (allow, reason, terminal). Pure apart from reading session state."""
     if P.session_halted(policy):
         return False, "session halted after a policy violation; stop and output RESULT:FAILED:policy_violation", True
+    guard_problem = P.network_guard_problem(policy)
+    if guard_problem:
+        return False, f"{guard_problem}; stop and output RESULT:FAILED:policy_violation", True
+    if P.dry_run_boundary_reached(policy):
+        return False, (f"{GUARD_PREFIX}: the page tried to transmit application data and the launcher "
+                       "blocked it. The dry run is complete. Output RESULT:DRY_RUN now."), False
     allowed = set(P.allowed_tool_names(policy.verify_enabled))
     if tool_name not in allowed:
         return False, f"tool '{tool_name}' is not permitted", True
@@ -92,24 +97,21 @@ def decide_pre(policy: P.SessionPolicy, tool_name: str, tool_input: dict) -> tup
     return True, "", False
 
 
-def wait_for_approval(policy: P.SessionPolicy, what: str, poll_s: float = 1.0) -> bool:
-    """Ask the human (out of band) to approve one submission. The agent cannot grant this."""
-    nonce = secrets.token_hex(8)
-    req = P.approval_request_path(policy.dir)
-    req.write_text(json.dumps({"nonce": nonce, "what": what, "t": time.time()}), encoding="utf-8")
-    grant = policy.dir / f"approval-grant-{nonce}.json"
+def wait_for_approval(policy: P.SessionPolicy, what: str, tool_input: dict | None = None,
+                      poll_s: float = 1.0) -> bool:
+    """Ask the human (out of band) to approve one submit action. The agent cannot grant this.
+
+    The grant is single-use, expires with the request and is bound to this job,
+    this session and this exact tool call (see ``approval``)."""
+    action = {"tool_action": what, "input": tool_input or {}}
+    req = approval.create_request(policy.dir, kind="click", job_url=policy.job_url, action=action,
+                                  ttl_s=policy.approval_timeout_s)
     print(f"{POLICY_PREFIX}: submission approval requested: applypilot apply --approve "
-          f"{policy.dir} --nonce {nonce}", file=sys.stderr)
-    deadline = time.time() + policy.approval_timeout_s
-    try:
-        while time.time() < deadline:
-            if grant.exists():
-                P.record_audit(policy, {"phase": "approval", "decision": "granted", "nonce": nonce})
-                return True
-            time.sleep(poll_s)
-        return False
-    finally:
-        req.unlink(missing_ok=True)
+          f"{policy.dir} --nonce {req['nonce']}", file=sys.stderr)
+    if approval.wait_for_grant(policy.dir, req, poll_s=poll_s, sleep=time.sleep):
+        P.record_audit(policy, {"phase": "approval", "decision": "granted", "nonce": req["nonce"]})
+        return True
+    return False
 
 
 def handle_pre(policy: P.SessionPolicy, event: dict) -> int:
@@ -122,7 +124,7 @@ def handle_pre(policy: P.SessionPolicy, event: dict) -> int:
     if allow and not policy.dry_run and policy.require_submit_approval:
         submit = _is_submit_like(tool, tool_input)
         if submit:
-            if wait_for_approval(policy, submit):
+            if wait_for_approval(policy, submit, tool_input if isinstance(tool_input, dict) else None):
                 P.record_audit(policy, {"phase": "pre", "tool": tool, "decision": "allow",
                                         "submit_approved": True, "id": event.get("tool_use_id")})
                 return 0
@@ -151,8 +153,13 @@ def handle_post(policy: P.SessionPolicy, event: dict) -> int:
     tool = event.get("tool_name") or ""
     text = _response_text(event.get("tool_response"))
     bad = None
+    guard_active = policy.require_network_guard and P.network_guard_problem(policy) is None
     for url in _PAGE_URL_RE.findall(text):
         url = url.strip().rstrip(",;)\\\"'")
+        if guard_active and url.lower().startswith("chrome-error://"):
+            # Chrome's local error page after the launcher guard failed a request before it was
+            # sent; the guard itself records any forbidden destination as a violation.
+            continue
         why = P.url_block_reason(url, policy.allowed_hosts, policy.trusted_hosts)
         if why:
             bad = f"browser left the approved sites ({why})"
