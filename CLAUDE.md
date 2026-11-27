@@ -7,11 +7,12 @@ Status and plan live in `PROJECT_STATUS.md`, `DEVELOPMENT_ROADMAP.md` and
 
 ## Hard rules
 - **Never submit real applications during development.** No browser-based apply runs (dry or real)
-  S1–S4 are done (`fcf9e31`): supervised `--dry-run` only, on a job the user picked. Live browser tests
+  S1–S4 + Phase 3b are done: supervised `--dry-run` only, on a job the user picked. Live browser tests
   otherwise only against local synthetic pages (`scripts/live_policy_probe.py`), never employer forms.
-  Dry runs are NOT submission-proof (submit detection is label-based; redirects reach their target before
-  the tripwire) — never describe them as safe to leave unattended. Never weaken the agent command line,
-  policy hooks or fail-closed checks; never run the apply agent by hand outside the launcher.
+  The launcher's NetworkGuard (egress proxy + CDP Fetch) blocks state-changing requests in dry runs, but
+  dry runs are still NOT certified submission-proof (see PROJECT_STATUS residual limits) — never describe
+  them as safe to leave unattended. Never weaken the agent command line, policy hooks, NetworkGuard,
+  approvals or fail-closed checks; never run the apply agent or Chrome by hand outside the launcher.
 - Apply status lifecycle is documented at the top of the DB section in `apply/launcher.py`.
   Never weaken: dry runs never set `applied`/`applied_at`; uncertain outcomes → `needs_review`, never
   auto-retried; results/releases pass `owner=job["agent_id"]`; outcome comes only from the final result event.
@@ -33,7 +34,7 @@ Status and plan live in `PROJECT_STATUS.md`, `DEVELOPMENT_ROADMAP.md` and
 ## Commands (PowerShell, repo root)
 ```powershell
 $env:APPLYPILOT_DIR = "$HOME\.applypilot-dev"
-.\.venv\Scripts\python.exe -m pytest tests/ -q          # 142 tests, unittest-style, temp DBs only
+.\.venv\Scripts\python.exe -m pytest tests/ -q          # 190 tests (~65 s, real headless Chrome), temp DBs only
 .\.venv\Scripts\python.exe -m ruff check <changed files> # repo-wide ruff has ~147 pre-existing findings; don't add new ones
 .\.venv\Scripts\applypilot.exe doctor                    # read-only setup check
 .\.venv\Scripts\applypilot.exe status                    # pipeline counts
@@ -61,6 +62,8 @@ Python 3.13 venv at `.venv`. Default LLM: local LM Studio at `http://127.0.0.1:1
   `dontAsk` + allowlist), verifies the init event (`verify_init_event`), audits hooks (`audit_session`),
   classifies via `classify_session` / `parse_agent_result`. `apply/policy.py` + `apply/policy_hook.py`
   are the per-session policy and hooks (dry-run guard included from `dry_run_guard.py`);
+  `apply/network_guard.py` (+ `network_policy`, `egress_proxy`, `cdp`) the launcher-owned network and
+  submission boundary; `apply/approval.py` single-use expiring approvals;
   `apply/verification_mcp.py` the optional readonly code helper; `apply/redact.py` log redaction;
   `apply/prompt.py` builds the agent prompt. Session files: `APP_DIR/apply-sessions/<id>/`.
 - `database.py` — single `jobs` table, `url` is the PK; stage state is columns (fit_score, tailored_resume_path, apply_status…).

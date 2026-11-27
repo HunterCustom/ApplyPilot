@@ -3,7 +3,23 @@
 _Status (2026-11-27, `fcf9e31`): **S1–S4 implemented**, S5 prompt change done, S6 not started.
 Verified by unit tests (`tests/test_apply_security.py`, synthetic only) and a live probe on local
 synthetic pages (`scripts/live_policy_probe.py`). No apply run (dry or real) has happened yet. Next
-security task: launcher-owned CDP network controller (roadmap Phase 3b)._
+security task was Phase 3b (below), now implemented and awaiting review._
+
+## Phase 3b — launcher-owned network + submission boundary (implemented)
+- **Why two layers**: CDP `Fetch` sees method/URL/type/frame before sending (incl. redirect hops,
+  OOPIFs, popups, workers) but not WebSockets and fails open if its client disconnects; an egress proxy
+  sees every connection (WebSockets, service workers, browser traffic) and owns DNS, but only hosts for
+  HTTPS. Playwright `--allowed-origins`/routes were rejected: they live inside the agent's MCP server
+  and cannot be verified by the launcher. A MITM proxy was rejected (CA install, TLS interception).
+- **Fail closed**: the agent starts only after a self-test shows a request held by Fetch *and* received
+  by the proxy in absolute form (loopback and DNS-name paths); the hooks deny every tool unless the
+  guard status file says verified; losing CDP, a target that cannot be intercepted, or a
+  WebSocket/WebTransport stops the session (`needs_review`).
+- **Measured** (synthetic only): forbidden-target hits after a redirect 1 → **0**; deceptively labelled
+  Continue/Next submits 0 POSTs in dry runs. Dedicated workers have no `Fetch` domain — their requests are
+  held by the parent page (tested); paused service workers need `Network.enable` queued before resume.
+- **Not generic submission-proof**: GET-with-side-effect APIs, the small WebSocket window and multi-request
+  ATS flows are documented limits; the conservative choice is one human approval per state-changing request.
 
 ## Implementation notes / deviations from the plan
 - **S1** as planned, plus `--setting-sources ""` (no user plugins/hooks/skills reach the agent) and

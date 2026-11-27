@@ -26,14 +26,18 @@ tripwire, real-run submit approval), no Gmail MCP (optional readonly verificatio
 in prompts, empty isolated Chrome profiles, redacted logs, lifecycle/concurrency fixes. Live probe on
 local synthetic pages. Details: `PROJECT_STATUS.md` § Safety model.
 
-## Phase 3b — Launcher-owned network controller (≈1 session) ← NEXT (dev, security)
-- Launcher attaches its own CDP session (Playwright `connect_over_cdp` / raw `Fetch.enable` with
-  auto-attach to new targets) and fails, *before they are sent*: every request (incl. redirect hops,
-  subframes, popups) to localhost / private / link-local / non-http(s) targets; top-level navigations
-  off the session allowlist; and, in dry runs, every non-GET request to the application origins
-  (independent, label-free dry-run boundary). WebSocket/beacon gaps documented and tested.
-- Verify with `scripts/live_policy_probe.py redirect` (target must receive **zero** hits) and a
-  synthetic form whose "Continue" button POSTs (must be blocked in dry runs).
+## Phase 3b — Launcher-owned network + submission boundary — DONE, AWAITING REVIEW
+Egress proxy (only network route, own DNS + IP pinning) + CDP `Fetch` controller (every target, every
+request incl. redirect hops, held before sending) + self-test before the agent starts; label-free dry-run
+boundary; single-use, expiring, action-bound approvals for real runs. Verified: live probe `redirect`
+0 hits at the forbidden target, `continue`/`jsnext` 0 POSTs; Chrome-driven tests for subresources,
+popups, workers, service workers, keyboard/auto submits, WebSocket stop, fail-closed paths.
+Residual limits: `PROJECT_STATUS.md` § Known remaining issues. **Do not start Phase 4 before review.**
+
+## Phase 3c — First supervised dry runs (after 3b review)
+- One user-picked job per run, `--dry-run`, watched. Review `network.jsonl` for blocked asset hosts and
+  extend `STATIC_ASSET_HOSTS` only with exact provider hosts. Expect runs to end at the first
+  state-changing request (by design).
 
 ## Phase 4 — Tailoring + cover letters on real data (≈0.5–1 session)
 Prerequisites (code, before any bulk generation):

@@ -12,8 +12,8 @@ _Updated 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81
 | Scoring | Working; evidence profile + NC priority ordering. Ineligible jobs are now skipped before the LLM. |
 | Geographic eligibility | **New**, deterministic, v1.0.0. Gates tailoring and applying (queue and `--url`). |
 | Tailoring / cover / PDF | Never run on this data. 11 eligible high scorers (on the evaluation copy). **Blocked on Phase 4 prerequisites** (judge-rejected output is accepted; no freshness check) — see roadmap. |
-| Apply | S1–S4 implemented (`fcf9e31`) and verified with unit tests + a live probe on local synthetic pages. **No apply run yet** (dry or real); next: supervised dry runs (security plan exit criteria). |
-| Tests | 142 pass (+18 subtests): apply safety + security boundaries, eligibility, LLM provider, scoring. |
+| Apply | S1–S4 (`fcf9e31`) + **Phase 3b network/submission boundary** (launcher-owned egress proxy + CDP Fetch controller) verified with Chrome-driven tests and live probes on local synthetic pages. **No apply run yet** (dry or real). Phase 3b awaits review before Phase 4. |
+| Tests | 190 pass (+128 subtests, ~65 s; 15 real-Chrome tests skip without Chrome or with `APPLYPILOT_SKIP_BROWSER_TESTS=1`). |
 
 ## Safety model (apply)
 - **Statuses**: NULL/`failed` (retryable), `dry_run`, `in_progress`, `applied`, `needs_review`, `manual`.
@@ -21,8 +21,9 @@ _Updated 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81
 - **Outcome**: read only from the agent's final stream-json `result` event; only standalone `RESULT:` lines
   count. Missing / malformed / conflicting results, agent errors, watchdog kills, interruptions after the
   agent started, policy violations, and any non-APPLIED result after a submit-like action → `needs_review`.
-- **APPLIED needs evidence** (real runs): an observed submit action **and** a human approval grant **and**
-  confirmation text in a browser result afterwards; otherwise `uncertain:applied_without_evidence`.
+- **APPLIED needs evidence** (real runs): an observed submit action **and** a human grant for the click
+  **and** a human grant for the request the network guard released **and** confirmation text afterwards;
+  otherwise `uncertain:applied_without_evidence`.
 - **Dry runs** never become `applied`; and since the guard is best-effort, every *uncertain* dry run (incl.
   interrupted after agent start, stale claims, agent claiming APPLIED) → `needs_review`, never requeued.
 - **Ownership**: claims carry `<session>:worker-N[:dry_run]`; results/releases apply only to the caller's
@@ -36,8 +37,26 @@ _Updated 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81
   job's domains + ATS list (no localhost/IPs/private/file:); uploads only the session's two PDFs;
   SSN/card-like values blocked; PostToolUse tripwire halts the session if the page URL leaves the
   allowlist. Dry-run submit guard included. Session files: `APP_DIR/apply-sessions/<id>/`.
-- **Submission authority (Task E)**: real runs need `--allow-real-submissions`; each submit-like action
-  blocks until `applypilot apply --approve <session> --nonce <id>` (10 min timeout → refused).
+- **Network + submission boundary (Phase 3b)** — `apply/network_guard.py`, `network_policy.py`,
+  `egress_proxy.py`, `cdp.py`. One `NetworkGuard` per job, in the launcher process:
+  - *Egress proxy* (started before Chrome): Chrome's only route (`--proxy-server`, `<-loopback>`,
+    `--host-resolver-rules` making Chrome's own DNS fail, QUIC off, WebRTC UDP off). HTTPS `CONNECT :443`
+    to allowlisted hosts only; resolves DNS itself, refuses if any address is non-public (incl. IPv6,
+    IPv4-mapped/NAT64/6to4/Teredo), connects to the vetted IP (no rebinding). Plain HTTP never forwarded.
+  - *CDP controller*: auto-attaches to every target paused (pages, popups, OOPIFs, workers, service
+    workers), enables `Fetch` before it runs, holds **every request incl. each redirect hop** until
+    decided: forbidden destinations/schemes (`file:` too) failed before sending; **dry runs: any non
+    GET/HEAD/OPTIONS request or GET form submission is failed and ends the run as DRY_RUN** (label-free);
+    real runs: each such request waits for a human grant. Static asset hosts are a fixed GET-only list for
+    subresource types; page content never widens any allowlist.
+  - *Fail closed*: no agent until a self-test proves Fetch interception and proxy routing (loopback and
+    names); `run_job` refuses without a guard; lost CDP connection, an un-interceptable target, a
+    WebSocket/WebTransport, `mailto:`/external schemes → guard failed / terminal violation, agent killed,
+    hooks deny every tool, `needs_review`. Hooks also deny all tools unless the guard status is verified.
+- **Submission authority (Task E + 3b)**: real runs need `--allow-real-submissions`; each submit-like click
+  *and* each state-changing request needs `applypilot apply --approve <session> --nonce <id>`. Grants are
+  single-use, expire with the request (10 min), and are bound to job URL + session + action digest
+  (`apply/approval.py`); replayed, stale, mismatched or malformed grants are refused.
 - **Email (S3)**: no Gmail MCP. Optional `verification_mcp` (one argument-less tool, gmail.readonly only,
   query fixed to session sender domains + start time) — enabled only if
   `APP_DIR/secrets/gmail_readonly.json` exists. **Not live-tested** (no credentials configured).
@@ -45,9 +64,14 @@ _Updated 2026-11-27 · Branch `feature/claude-development` · Audit baseline `81
   isolated worker profiles (never cloned; legacy unmarked profiles refused); logs redacted; agent env
   stripped of API keys/tokens.
 - **CAPTCHA**: detect, `RESULT:CAPTCHA`, stop. Never solved.
-- **Live probe** (`scripts/live_policy_probe.py`, local synthetic pages only, 2026-11-27): init surface
-  OK (no built-ins, no evaluate); off-origin navigation blocked before any request; SSN typing blocked;
-  302 redirect to an internal server **detected and halted, but the GET reached it** (see issues).
+- **Live probe** (`scripts/live_policy_probe.py`, local synthetic pages only, real restricted agent,
+  2026-11-27): S1/S2 as before; Phase 3b — `redirect`: forbidden internal server **0 requests** (was 1
+  GET before 3b), hop held at the CDP layer; `continue` (button labelled Continue that POSTs): **0 POSTs**,
+  run ends DRY_RUN; `jsnext` (Next button, JS `fetch` POST): **0 POSTs**, DRY_RUN.
+- **Chrome-driven tests** (`tests/test_network_boundary.py`, no model): 0 requests at the forbidden
+  server for redirects, img/script/css/iframe/fetch/XHR/beacon, popups, integer-IP URLs; 0 POSTs for
+  Continue/Next/Finish buttons, GET forms, JS fetch/XHR/beacon, Enter key, auto-submit, dedicated and
+  service workers; real-run POST released once per grant, expired request never sent.
 
 Resolving `needs_review`: check the portal/email, then `applypilot apply --mark-applied URL` or
 `--mark-failed URL` (then `--reset-failed` to requeue).
@@ -133,13 +157,20 @@ Totals: 5 eligible_nc + 6 eligible_us_remote ready to tailor; 6 NC-commute revie
   condense output (use `ctx_execute` for large data, `Read` with offset/limit for source).
 
 ## Known remaining issues
-- **Redirects / subresources**: the policy sees navigation only via tool inputs and resulting page URL.
-  A redirect (or page script) can make the browser *request* a private/off-list URL before the tripwire
-  halts the session. Fix: launcher-owned CDP `Fetch` interception (next security task).
-- **Dry runs are not submission-proof**: submit detection is label-based; an unlabelled submit is not
-  blocked (it is caught afterwards only if the agent reports oddly). Supervise every dry run.
-- Approval gate also keys on labels: an unrecognised submit control bypasses approval (APPLIED then lacks
-  evidence → `needs_review`, but the submission happened).
+- **Phase 3b residual limits** (details: `APPLY_AGENT_SECURITY_PLAN.md` § Phase 3b):
+  - Dry runs block state-changing *requests*, not side effects of plain GETs: a site whose API changes
+    state via JS GET with query data is not recognised (non-standard; GET form submissions are caught).
+  - WebSocket/WebTransport traffic cannot be held by Fetch: the session is stopped when one opens, but a
+    few frames could leave before that (to allowlisted hosts only; the proxy still enforces hosts).
+  - Real runs ask for one approval per state-changing request; multi-step ATS (Workday autosave, S3
+    resume upload) will need several approvals per application. Conservative by design.
+  - Strict allowlists may break pages that need unlisted CDNs; such sessions fail → `needs_review`. Extend
+    `network_policy.STATIC_ASSET_HOSTS` (exact provider hosts only) after reviewing a blocked log.
+  - Shared workers are untested (fail closed if Fetch cannot attach). Trusted host only: a tampered venv,
+    Chrome binary or a local process using the CDP port defeats the guard.
+  - The label-based click guard remains as an extra layer; the network boundary does not depend on it.
+- Dry runs are now label-free at the network layer but still **supervised** (first runs on real ATS pages
+  will reveal compatibility gaps).
 - Hooks run as `sys.executable -m applypilot...`; tampering with the venv defeats them (trusted host).
 - User-global `~/.claude/CLAUDE.md` may still be loaded into the agent's context (no secrets in it).
 - No pre-apply liveness/freshness check; scores/descriptions are from 2026-11-23.
