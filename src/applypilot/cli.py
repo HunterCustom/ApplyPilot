@@ -383,20 +383,29 @@ def doctor() -> None:
 
     # --- Tier 2 checks ---
     import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+
+    from applypilot.llm import describe_provider, list_local_models
+    try:
+        llm = describe_provider()
+    except RuntimeError:
+        results.append(("LLM provider", fail_mark,
+                        "Set LLM_URL, GEMINI_API_KEY or OPENAI_API_KEY in .env (run 'applypilot init')"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        if llm["provider"] == "Local":
+            note = f"Local {llm['base_url']} model={llm['model']}"
+            served = list_local_models(llm["base_url"])
+            if served is None:
+                results.append(("LLM provider", warn_mark, f"{note} (endpoint not reachable)"))
+            elif llm["model"] not in served:
+                results.append(("LLM provider", fail_mark,
+                                f"{note} not served; available: {', '.join(served) or 'none'}"))
+            else:
+                results.append(("LLM provider", ok_mark, f"{note} (served)"))
+        else:
+            results.append(("LLM provider", ok_mark, f"{llm['provider']} model={llm['model']}"))
+        if llm["ignored"]:
+            results.append(("LLM provider", warn_mark,
+                            f"Ignored (lower precedence): {', '.join(llm['ignored'])}"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI

@@ -59,6 +59,37 @@ def _detect_provider() -> tuple[str, str, str]:
     )
 
 
+def describe_provider() -> dict:
+    """Describe the effective provider without exposing credentials.
+
+    Returns {"provider", "base_url", "model", "ignored"} where ``ignored``
+    lists configured keys that _detect_provider() does not use. Raises
+    RuntimeError when nothing is configured.
+    """
+    base_url, model, _ = _detect_provider()
+    if os.environ.get("LLM_URL"):
+        provider = "Local"
+        ignored = [k for k in ("GEMINI_API_KEY", "OPENAI_API_KEY") if os.environ.get(k)]
+    elif os.environ.get("GEMINI_API_KEY"):
+        provider, ignored = "Gemini", ["OPENAI_API_KEY"] if os.environ.get("OPENAI_API_KEY") else []
+    else:
+        provider, ignored = "OpenAI", []
+    return {"provider": provider, "base_url": base_url, "model": model, "ignored": ignored}
+
+
+def list_local_models(base_url: str, timeout: float = 3.0) -> list[str] | None:
+    """Return model ids served by an OpenAI-compatible endpoint, or None if unreachable."""
+    headers = {}
+    if os.environ.get("LLM_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['LLM_API_KEY']}"
+    try:
+        resp = httpx.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return [m.get("id", "") for m in resp.json().get("data", [])]
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
