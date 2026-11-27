@@ -507,9 +507,15 @@ def build_prompt(job: dict, tailored_resume: str,
     last_name = full_name.split()[-1] if " " in full_name else ""
     display_name = f"{preferred_name} {last_name}".strip()
 
+    result_success_line = (
+        "RESULT:DRY_RUN -- form completed and reviewed, NOT submitted (dry run)"
+        if dry_run else
+        "RESULT:APPLIED -- submitted successfully"
+    )
+
     # Dry-run: override submit instruction
     if dry_run:
-        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
+        submit_instruction = "DRY RUN -- IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then STOP and output RESULT:DRY_RUN. Never output RESULT:APPLIED in a dry run."
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
@@ -585,7 +591,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 12. Output your result.
 
 == RESULT CODES (output EXACTLY one) ==
-RESULT:APPLIED -- submitted successfully
+{result_success_line}
 RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
 RESULT:LOGIN_ISSUE -- could not sign in or create account

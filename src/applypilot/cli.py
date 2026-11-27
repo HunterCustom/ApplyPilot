@@ -284,6 +284,9 @@ def status() -> None:
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
+    summary.add_row("Dry runs (not submitted)", str(stats["dry_run"]))
+    review_style = "[bold red]" if stats["needs_review"] else ""
+    summary.add_row("Needs human review", f"{review_style}{stats['needs_review']}")
 
     console.print(summary)
 

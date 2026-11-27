@@ -49,9 +49,14 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
+# Hard ceiling on one agent session; a hung session is killed and flagged for review.
+APPLY_MAX_SECONDS = int(os.environ.get("APPLYPILOT_APPLY_MAX_SECONDS", "1200"))
+
 # Track active Claude Code processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
 _claude_lock = threading.Lock()
+# Workers whose current job reached the agent (a submission may have happened).
+_agent_started: set[int] = set()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -87,86 +92,134 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # Database operations
 # ---------------------------------------------------------------------------
 
+# Apply status lifecycle
+#   NULL / 'failed' (attempts < max)  -> eligible for the queue
+#   'dry_run'                         -> eligible for real runs; skipped by dry-run batches
+#   'in_progress'                     -> claimed by a worker (agent_id marks dry-run claims)
+#   'applied'                         -> terminal; only set by a real run or --mark-applied
+#   'needs_review'                    -> outcome unknown (agent may have submitted); a human
+#                                        must resolve it with --mark-applied / --mark-failed
+#   'manual'                          -> ATS requires manual handling
+# Statuses that block acquisition of any other row sharing the same application_url.
+DUPLICATE_BLOCKING_STATUSES = ("applied", "in_progress", "needs_review")
+DRY_RUN_AGENT_SUFFIX = ":dry_run"
+
+_JOB_COLUMNS = """j.url, j.title, j.site, j.application_url, j.tailored_resume_path,
+                  j.fit_score, j.location, j.full_description, j.cover_letter_path"""
+
+# No other row for the same application URL may already be applied, claimed or under review.
+_NO_DUPLICATE_CLAUSE = f"""NOT EXISTS (
+        SELECT 1 FROM jobs AS o
+        WHERE o.url != j.url
+          AND o.application_url IS NOT NULL
+          AND o.application_url = j.application_url
+          AND o.apply_status IN ({",".join(repr(s) for s in DUPLICATE_BLOCKING_STATUSES)})
+    )"""
+
+
+def _like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _select_target(conn, target_url: str):
+    """Find an explicitly requested job. Exact URL matches win over substring matches."""
+    like = f"%{_like_escape(target_url.split('?')[0].rstrip('/'))}%"
+    return conn.execute(f"""
+        SELECT {_JOB_COLUMNS}
+        FROM jobs AS j
+        WHERE (j.url = ? OR j.application_url = ?
+               OR j.application_url LIKE ? ESCAPE '\\' OR j.url LIKE ? ESCAPE '\\')
+          AND j.tailored_resume_path IS NOT NULL
+          AND (j.apply_status IS NULL OR j.apply_status IN ('failed', 'dry_run'))
+          AND {_NO_DUPLICATE_CLAUSE}
+        ORDER BY (j.url = ? OR j.application_url = ?) DESC, j.url
+        LIMIT 1
+    """, (target_url, target_url, like, like, target_url, target_url)).fetchone()
+
+
+def _select_next(conn, min_score: int, dry_run: bool):
+    """Pick the highest-scoring retry-eligible job from the queue."""
+    blocked_sites, blocked_patterns = _load_blocked()
+    params: list = [config.DEFAULTS["max_apply_attempts"], min_score]
+    site_clause = ""
+    if blocked_sites:
+        placeholders = ",".join("?" * len(blocked_sites))
+        site_clause = f"AND j.site NOT IN ({placeholders})"
+        params.extend(blocked_sites)
+    url_clauses = " ".join("AND j.url NOT LIKE ?" for _ in blocked_patterns)
+    params.extend(blocked_patterns)
+    # Real runs may pick up jobs that were only dry-run; dry-run batches move on to new jobs.
+    statuses = "('failed')" if dry_run else "('failed', 'dry_run')"
+    return conn.execute(f"""
+        SELECT {_JOB_COLUMNS}
+        FROM jobs AS j
+        WHERE j.tailored_resume_path IS NOT NULL
+          AND (j.apply_status IS NULL OR j.apply_status IN {statuses})
+          AND (j.apply_attempts IS NULL OR j.apply_attempts < ?)
+          AND j.fit_score >= ?
+          {site_clause}
+          {url_clauses}
+          AND {_NO_DUPLICATE_CLAUSE}
+        ORDER BY j.fit_score DESC, j.url
+        LIMIT 1
+    """, params).fetchone()
+
+
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
-    """Atomically acquire the next job to apply to.
+                worker_id: int = 0, dry_run: bool = False) -> dict | None:
+    """Atomically claim the next job to apply to.
+
+    Selection and claim run inside one ``BEGIN IMMEDIATE`` transaction, so
+    concurrent workers (each with its own connection) can never claim the
+    same row. Applied, in-progress and needs-review jobs are never returned,
+    nor are jobs whose application URL was already applied to via another row.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
-        min_score: Minimum fit_score threshold.
+        min_score: Minimum fit_score threshold (queue mode only).
         worker_id: Worker claiming this job (for tracking).
+        dry_run: Claim for a dry run (recorded in agent_id for crash recovery).
 
     Returns:
-        Job dict or None if the queue is empty.
+        Job dict or None if nothing eligible is available.
     """
+    from applypilot.config import is_manual_ats
+
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        while True:
+            row = _select_target(conn, target_url) if target_url else _select_next(conn, min_score, dry_run)
+            if not row:
+                conn.rollback()
+                return None
 
-        if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
-        else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
-                  {site_clause}
-                  {url_clauses}
-                ORDER BY fit_score DESC, url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            apply_url = row["application_url"] or row["url"]
+            if is_manual_ats(apply_url):
+                # Unsolvable-CAPTCHA ATS: hand off to the human and keep looking.
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                    (row["url"],),
+                )
+                logger.info("Skipping manual ATS: %s", row["url"][:80])
+                if target_url:
+                    conn.commit()
+                    return None
+                continue
 
-        if not row:
-            conn.rollback()
-            return None
-
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
-        from applypilot.config import is_manual_ats
-        apply_url = row["application_url"] or row["url"]
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
+            agent_id = f"worker-{worker_id}" + (DRY_RUN_AGENT_SUFFIX if dry_run else "")
+            claimed = conn.execute("""
+                UPDATE jobs SET apply_status = 'in_progress',
+                               agent_id = ?,
+                               last_attempted_at = ?
+                WHERE url = ?
+                  AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))
+            """, (agent_id, datetime.now(timezone.utc).isoformat(), row["url"])).rowcount
+            if claimed != 1:  # Defensive: the row changed under us.
+                conn.rollback()
+                return None
             conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
-
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
-                           last_attempted_at = ?
-            WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
-        conn.commit()
-
-        return dict(row)
+            return dict(row)
     except Exception:
         conn.rollback()
         raise
@@ -175,9 +228,15 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
-    """Update a job's apply status in the database."""
+    """Update a job's apply status in the database.
+
+    Only status 'applied' ever sets applied_at. Non-applied statuses never
+    overwrite an 'applied' row. 'dry_run' and 'needs_review' leave
+    apply_attempts untouched so they never consume retries.
+    """
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    not_applied = "AND (apply_status IS NULL OR apply_status != 'applied')"
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
@@ -185,15 +244,76 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
+    elif status in ("dry_run", "needs_review"):
+        conn.execute(f"""
+            UPDATE jobs SET apply_status = ?, apply_error = ?, agent_id = NULL,
+                           apply_duration_ms = ?, apply_task_id = ?
+            WHERE url = ? {not_applied}
+        """, (status, error, duration_ms, task_id, url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
+            WHERE url = ? {not_applied}
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
+
+
+def record_outcome(url: str, result: str, dry_run: bool,
+                   duration_ms: int | None = None) -> str:
+    """Persist an agent result. Returns 'applied', 'dry_run', 'needs_review' or 'failed'.
+
+    Launcher-side enforcement: a dry run can never be recorded as applied,
+    whatever the agent reports, and never consumes retry attempts. In real
+    runs, outcomes where a submission may have happened ('uncertain:*') go
+    to human review instead of being retried.
+    """
+    if dry_run:
+        note = None if result in ("applied", "dry_run") else f"dry_run:{result}"
+        mark_result(url, "dry_run", note, duration_ms=duration_ms)
+        return "dry_run"
+    if result == "applied":
+        mark_result(url, "applied", duration_ms=duration_ms)
+        return "applied"
+    if result == "dry_run":
+        result = "uncertain:unexpected_dry_run_result"
+    if result.startswith("uncertain:"):
+        mark_result(url, "needs_review", result, duration_ms=duration_ms)
+        return "needs_review"
+    reason = result.split(":", 1)[-1] if ":" in result else result
+    mark_result(url, "failed", reason, permanent=_is_permanent_failure(result),
+                duration_ms=duration_ms)
+    return "failed"
+
+
+def recover_stale_locks(max_age_seconds: int | None = None) -> int:
+    """Resolve 'in_progress' claims left behind by crashed or killed workers.
+
+    Dry-run claims are released back to the queue. Real claims become
+    'needs_review': the agent may have submitted before dying, so retrying
+    automatically could produce a duplicate application.
+
+    Returns:
+        Number of rows recovered.
+    """
+    if max_age_seconds is None:
+        max_age_seconds = APPLY_MAX_SECONDS + 300
+    cutoff = datetime.fromtimestamp(time.time() - max_age_seconds, tz=timezone.utc).isoformat()
+    stale = "apply_status = 'in_progress' AND (last_attempted_at IS NULL OR last_attempted_at < ?)"
+    conn = get_connection()
+    released = conn.execute(f"""
+        UPDATE jobs SET apply_status = NULL, agent_id = NULL
+        WHERE {stale} AND agent_id LIKE ?
+    """, (cutoff, f"%{DRY_RUN_AGENT_SUFFIX}")).rowcount
+    flagged = conn.execute(f"""
+        UPDATE jobs SET apply_status = 'needs_review',
+                       apply_error = 'uncertain:interrupted_stale_lock', agent_id = NULL
+        WHERE {stale}
+    """, (cutoff,)).rowcount
+    conn.commit()
+    return released + flagged
 
 
 def release_lock(url: str) -> None:
@@ -275,6 +395,9 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
 def reset_failed() -> int:
     """Reset all failed jobs so they can be retried.
 
+    Never touches applied, in-progress or needs-review jobs: a needs-review
+    job may already have been submitted and must be resolved by a human.
+
     Returns:
         Number of jobs reset.
     """
@@ -282,9 +405,8 @@ def reset_failed() -> int:
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
                        apply_attempts = 0, agent_id = NULL
-        WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
+        WHERE apply_status IS NOT NULL
+          AND apply_status NOT IN ('applied', 'in_progress', 'needs_review')
     """)
     conn.commit()
     return cursor.rowcount
@@ -293,6 +415,36 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 # Per-job execution
 # ---------------------------------------------------------------------------
+
+_RESULT_RE = re.compile(r"RESULT:([A-Z_]+)(?::[ \t]*([^\n]*))?")
+_SIMPLE_RESULTS = {"APPLIED", "DRY_RUN", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"}
+_PROMOTE_FAILURE_REASONS = {"captcha", "expired", "login_issue"}
+
+
+def parse_agent_result(output: str) -> str:
+    """Classify the agent's transcript into a launcher result string.
+
+    Returns 'applied', 'dry_run', 'expired', 'captcha', 'login_issue',
+    'failed:<reason>' or 'uncertain:<reason>'. The LAST result code wins
+    (the agent may mention codes while planning). A transcript claiming
+    APPLIED alongside any other code is ambiguous and is never trusted.
+    """
+    matches = _RESULT_RE.findall(output or "")
+    if not matches:
+        return "uncertain:no_result_line"
+    codes = {code for code, _ in matches}
+    if "APPLIED" in codes and len(codes) > 1:
+        return "uncertain:conflicting_results"
+    code, reason = matches[-1]
+    if code in _SIMPLE_RESULTS:
+        return code.lower()
+    if code == "FAILED":
+        reason = re.sub(r'[*`"]+$', "", reason or "").strip() or "unknown"
+        if reason.lower() in _PROMOTE_FAILURE_REASONS:
+            return reason.lower()
+        return f"failed:{reason}"
+    return f"uncertain:unrecognized_result_{code.lower()}"
+
 
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
@@ -367,6 +519,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     start = time.time()
     stats: dict = {}
     proc = None
+    watchdog_fired = threading.Event()
+    watchdog: threading.Timer | None = None
+    agent_launched = False
 
     try:
         proc = subprocess.Popen(
@@ -380,8 +535,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
+        agent_launched = True
         with _claude_lock:
             _claude_procs[worker_id] = proc
+            _agent_started.add(worker_id)
+
+        def _on_watchdog(p=proc):
+            watchdog_fired.set()
+            _kill_process_tree(p.pid)
+
+        watchdog = threading.Timer(APPLY_MAX_SECONDS, _on_watchdog)
+        watchdog.daemon = True
+        watchdog.start()
 
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
@@ -441,12 +606,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     text_parts.append(line)
                     lf.write(line + "\n")
 
-        proc.wait(timeout=300)
+        proc.wait(timeout=config.DEFAULTS["apply_timeout"])
         returncode = proc.returncode
         proc = None
-
-        if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
@@ -462,53 +624,35 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
 
-        def _clean_reason(s: str) -> str:
-            return re.sub(r'[*`"]+$', '', s).strip()
+        result = parse_agent_result(output)
+        if result.startswith("uncertain:"):
+            if watchdog_fired.is_set():
+                result = "uncertain:watchdog_timeout"
+            elif returncode and returncode < 0:
+                result = "uncertain:interrupted"
 
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
-            if f"RESULT:{result_status}" in output:
-                add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
-                             last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
-
-        if "RESULT:FAILED" in output:
-            for out_line in output.split("\n"):
-                if "RESULT:FAILED" in out_line:
-                    reason = (
-                        out_line.split("RESULT:FAILED:")[-1].strip()
-                        if ":" in out_line[out_line.index("FAILED") + 6:]
-                        else "unknown"
-                    )
-                    reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
-                    if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
-                        update_state(worker_id, status=reason,
-                                     last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
-                    add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
-                    update_state(worker_id, status="failed",
-                                 last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
-
-        add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
+        label, _, detail = result.partition(":")
+        add_event(f"[W{worker_id}] {label.upper()} ({elapsed}s): {(detail or job['title'])[:30]}")
+        update_state(worker_id, status=label, last_action=f"{label.upper()} ({elapsed}s)")
+        return result, duration_ms
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        update_state(worker_id, status="uncertain", last_action=f"TIMEOUT ({elapsed}s)")
+        return "uncertain:timeout", duration_ms
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        if not agent_launched:
+            # The agent never started, so nothing can have been submitted.
+            return f"failed:launch_error:{str(e)[:80]}", duration_ms
+        return f"uncertain:error:{str(e)[:80]}", duration_ms
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
@@ -545,6 +689,21 @@ def _is_permanent_failure(result: str) -> bool:
 # Worker loop
 # ---------------------------------------------------------------------------
 
+def _release_interrupted(url: str, worker_id: int, dry_run: bool, reason: str) -> None:
+    """Handle a job abandoned mid-flight (Ctrl+C or launcher error).
+
+    If the agent never started, or this is a dry run, the claim is simply
+    released. Otherwise the agent may already have submitted, so the job is
+    flagged for human review rather than silently returned to the queue.
+    """
+    with _claude_lock:
+        started = worker_id in _agent_started
+    if started and not dry_run:
+        mark_result(url, "needs_review", reason)
+    else:
+        release_lock(url)
+
+
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
@@ -578,7 +737,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, dry_run=dry_run)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -595,6 +754,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+        with _claude_lock:
+            _agent_started.discard(worker_id)
 
         chrome_proc = None
         try:
@@ -604,26 +765,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
 
-            if result == "skipped":
-                release_lock(job["url"])
-                add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
-                continue
-            elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
+            outcome = record_outcome(job["url"], result, dry_run=dry_run,
+                                     duration_ms=duration_ms)
+            if outcome == "applied" or (dry_run and result in ("applied", "dry_run")):
                 applied += 1
-                update_state(worker_id, jobs_applied=applied,
-                             jobs_done=applied + failed)
             else:
-                reason = result.split(":", 1)[-1] if ":" in result else result
-                mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms)
                 failed += 1
-                update_state(worker_id, jobs_failed=failed,
-                             jobs_done=applied + failed)
+                if outcome == "needs_review":
+                    add_event(f"[W{worker_id}] NEEDS REVIEW: {job['title'][:30]}")
+            update_state(worker_id, jobs_applied=applied, jobs_failed=failed,
+                         jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            release_lock(job["url"])
+            _release_interrupted(job["url"], worker_id, dry_run, "uncertain:interrupted")
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -631,7 +785,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
+            _release_interrupted(job["url"], worker_id, dry_run,
+                                 f"uncertain:launcher_error:{str(e)[:80]}")
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
@@ -673,6 +828,14 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+
+    recovered = recover_stale_locks()
+    if recovered:
+        console.print(f"[yellow]Recovered {recovered} stale in-progress job(s); "
+                      "real-run ones are marked needs_review.[/yellow]")
+    if dry_run:
+        console.print("[bold yellow]DRY RUN: applications will not be submitted or "
+                      "recorded as applied.[/bold yellow]")
 
     if continuous:
         effective_limit = 0
@@ -781,8 +944,9 @@ def main(limit: int = 1, target_url: str | None = None,
             live.update(render_full())
 
         totals = get_totals()
+        done_label = "dry runs completed" if dry_run else "applied"
         console.print(
-            f"\n[bold]Done: {total_applied} applied, {total_failed} failed "
+            f"\n[bold]Done: {total_applied} {done_label}, {total_failed} not completed "
             f"(${totals['cost']:.3f})[/bold]"
         )
         console.print(f"Logs: {config.LOG_DIR}")

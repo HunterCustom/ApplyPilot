@@ -316,6 +316,14 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
     ).fetchone()[0]
 
+    stats["dry_run"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'dry_run'"
+    ).fetchone()[0]
+
+    stats["needs_review"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'needs_review'"
+    ).fetchone()[0]
+
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
