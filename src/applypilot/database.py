@@ -180,6 +180,13 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Geographic eligibility (deterministic, see applypilot.eligibility)
+    "eligibility_status": "TEXT",
+    "eligibility_reason": "TEXT",
+    "eligibility_evidence": "TEXT",
+    "eligibility_tier": "TEXT",
+    "eligibility_version": "TEXT",
+    "eligibility_at": "TEXT",
 }
 
 
