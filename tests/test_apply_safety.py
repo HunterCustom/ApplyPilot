@@ -58,7 +58,7 @@ class ApplySafetyTestCase(unittest.TestCase):
 
 
 class DryRunSafetyTests(ApplySafetyTestCase):
-    def test_dry_run_agent_claiming_applied_is_recorded_as_dry_run(self):
+    def test_dry_run_agent_claiming_applied_goes_to_review(self):
         self.add_job(f"{ATS}/1")
         job = launcher.acquire_job(dry_run=True)
         self.assertEqual(self.row(job["url"])["agent_id"], f"{launcher.SESSION_ID}:worker-0:dry_run")
@@ -66,9 +66,11 @@ class DryRunSafetyTests(ApplySafetyTestCase):
 
         outcome = launcher.record_outcome(job["url"], "applied", dry_run=True)
 
+        # A dry-run agent claiming APPLIED may really have submitted: review, never requeue.
         row = self.row(job["url"])
-        self.assertEqual(outcome, "dry_run")
-        self.assertEqual(row["apply_status"], "dry_run")
+        self.assertEqual(outcome, "needs_review")
+        self.assertEqual(row["apply_status"], "needs_review")
+        self.assertEqual(row["apply_error"], "uncertain:applied_claimed_in_dry_run")
         self.assertIsNone(row["applied_at"])
         self.assertIsNone(row["apply_attempts"])
 
@@ -154,7 +156,8 @@ class SessionClassificationTests(unittest.TestCase):
     def test_failure_after_submit_click_needs_review(self):
         self.assertEqual(self.classify("RESULT:FAILED:page_error", submit_attempts=1),
                          "uncertain:after_submit_action:failed:page_error")
-        self.assertEqual(self.classify("RESULT:APPLIED", submit_attempts=1), "applied")
+        self.assertEqual(self.classify("RESULT:APPLIED", submit_attempts=1, submit_approved=True,
+                                       confirmation_seen=True), "applied")
         self.assertEqual(self.classify("RESULT:FAILED:page_error"), "failed:page_error")
 
     def test_watchdog_and_agent_error_are_uncertain(self):
@@ -170,19 +173,18 @@ class SessionClassificationTests(unittest.TestCase):
 
 
 class CommandAndGuardTests(unittest.TestCase):
-    def test_dry_run_command_blocks_email_and_installs_guard(self):
-        cmd = launcher.build_agent_command("sonnet", Path("m.json"), True, Path("s.json"))
-        self.assertIn("--strict-mcp-config", cmd)
-        self.assertIn("mcp__gmail__send_email", cmd[cmd.index("--disallowedTools") + 1])
-        self.assertEqual(cmd[cmd.index("--settings") + 1], "s.json")
-        with self.assertRaises(ValueError):
-            launcher.build_agent_command("sonnet", Path("m.json"), True, None)
+    def test_every_command_requires_policy_settings(self):
+        for dry in (True, False):
+            cmd = launcher.build_agent_command("sonnet", Path("m.json"), dry, Path("s.json"))
+            self.assertIn("--strict-mcp-config", cmd)
+            self.assertEqual(cmd[cmd.index("--settings") + 1], "s.json")
+            with self.assertRaises(ValueError):
+                launcher.build_agent_command("sonnet", Path("m.json"), dry, None)
 
-    def test_real_command_has_no_guard_but_still_strict(self):
-        cmd = launcher.build_agent_command("sonnet", Path("m.json"), False)
-        self.assertIn("--strict-mcp-config", cmd)
-        self.assertNotIn("--settings", cmd)
-        self.assertNotIn("mcp__gmail__send_email", cmd[cmd.index("--disallowedTools") + 1])
+    def test_command_has_no_email_server_tools(self):
+        cmd = launcher.build_agent_command("sonnet", Path("m.json"), False, Path("s.json"))
+        self.assertNotIn("gmail", " ".join(cmd))
+        self.assertNotIn("gmail", str(launcher._make_mcp_config(9222)))
 
     def test_guard_blocks_submit_like_actions(self):
         from applypilot.apply.dry_run_guard import blocked_reason
@@ -428,7 +430,8 @@ class RetryAndRecoveryTests(ApplySafetyTestCase):
 
         self.assertEqual(launcher.recover_stale_locks(max_age_seconds=3600), 2)
         self.assertEqual(self.row(f"{ATS}/real")["apply_status"], "needs_review")
-        self.assertIsNone(self.row(f"{ATS}/dry")["apply_status"])
+        # A stale dry-run claim may hide a submission the best-effort guard missed.
+        self.assertEqual(self.row(f"{ATS}/dry")["apply_status"], "needs_review")
         self.assertEqual(self.row(f"{ATS}/live")["apply_status"], "in_progress")
 
     def test_late_result_cannot_overwrite_manual_resolution(self):

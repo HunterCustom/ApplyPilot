@@ -1,11 +1,13 @@
 """Chrome lifecycle management for apply workers.
 
 Handles launching an isolated Chrome instance with remote debugging,
-worker profile setup/cloning, and cross-platform process cleanup.
+isolated (empty) worker profiles, per-worker slot locks, and
+cross-platform process cleanup.
 """
 
 import json
 import logging
+import os
 import platform
 import shutil
 import subprocess
@@ -132,65 +134,69 @@ def _kill_on_port(port: int) -> bool:
 # Worker profile management
 # ---------------------------------------------------------------------------
 
+PROFILE_MARKER = ".applypilot-isolated"
+
+# Per-worker slot locks held by this process (OS file locks, released on process exit).
+_slot_handles: dict[int, object] = {}
+
+
+def acquire_worker_slot(worker_id: int) -> None:
+    """Take an exclusive OS lock on worker slot ``worker_id`` for this process.
+
+    Two launcher processes using the same worker id would share a CDP port and
+    a Chrome profile, and one would kill the other's Chrome mid-application.
+    The lock makes the second launcher refuse instead. It is released
+    automatically when the process exits, so it can never go stale.
+    """
+    if worker_id in _slot_handles:
+        return
+    path = config.CHROME_WORKER_DIR / f"worker-{worker_id}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+b")  # noqa: SIM115 -- the handle must stay open to hold the lock
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise RuntimeError(
+            f"worker slot {worker_id} is in use by another ApplyPilot launcher; "
+            "use a different worker id or wait for it to finish"
+        ) from None
+    _slot_handles[worker_id] = fh
+
+
+def release_worker_slots() -> None:
+    for wid, fh in list(_slot_handles.items()):
+        try:
+            fh.close()  # closing the handle releases the OS lock
+        finally:
+            _slot_handles.pop(wid, None)
+
+
 def setup_worker_profile(worker_id: int) -> Path:
-    """Create an isolated Chrome profile for a worker.
+    """Create (or reuse) an isolated, initially EMPTY Chrome profile for a worker.
 
-    On first run, clones from an existing worker profile (preferred, since
-    it already has session cookies) or from the user's real Chrome profile.
-    Subsequent runs reuse the existing worker profile.
-
-    Args:
-        worker_id: Numeric worker identifier.
-
-    Returns:
-        Path to the worker's Chrome user-data directory.
+    The user's personal Chrome profile is never copied: it holds sessions for
+    email, banking and every other site. Profiles are marked on creation; a
+    profile without the marker (made by an older version that cloned the
+    personal profile) is refused until the user deletes it.
     """
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
-    if (profile_dir / "Default").exists():
-        return profile_dir  # Already initialized
-
-    # Find a source: prefer existing worker (has session cookies), else user profile
-    source: Path | None = None
-    for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
-            source = candidate
-            break
-    if source is None:
-        source = config.get_chrome_user_data()
-
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
+    marker = profile_dir / PROFILE_MARKER
+    if profile_dir.exists() and any(profile_dir.iterdir()) and not marker.exists():
+        raise RuntimeError(
+            f"Chrome worker profile {profile_dir} was not created as an isolated profile "
+            "(older versions cloned your personal Chrome profile). Delete that folder and retry."
+        )
     profile_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
-
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
-
+    if not marker.exists():
+        marker.write_text("created empty by ApplyPilot; never cloned\n", encoding="utf-8")
+        logger.info("[worker-%d] Created empty isolated Chrome profile", worker_id)
     return profile_dir
 
 
@@ -236,6 +242,8 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
+    # Exclusive slot first: only then is a Chrome on this port/profile provably a leftover of ours.
+    acquire_worker_slot(worker_id)
     profile_dir = setup_worker_profile(worker_id)
 
     # Kill a leftover ApplyPilot Chrome from a previous run on this port (never anything else)
@@ -259,12 +267,15 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--no-default-browser-check",
         "--window-size=1024,768",
         "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding,AutofillServerCommunication",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
         "--password-store=basic",
         "--disable-save-password-bubble",
         "--disable-popup-blocking",
+        # Isolated application browser: no sign-in/sync, no extensions, no autofill of other data
+        "--disable-sync",
+        "--disable-extensions",
         # Block dangerous permissions at browser level
         "--use-fake-device-for-media-stream",
         "--use-fake-ui-for-media-stream",
@@ -352,3 +363,4 @@ def cleanup_on_exit() -> None:
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
         _kill_on_port(BASE_CDP_PORT + wid)  # ownership-checked: only ApplyPilot Chrome
+    release_worker_slots()

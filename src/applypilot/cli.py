@@ -157,8 +157,22 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    approve: str | None = typer.Option(None, "--approve", help="Approve one pending submission: the session dir printed by the policy hook."),
+    nonce: str | None = typer.Option(None, "--nonce", help="Nonce of the pending submission (with --approve)."),
+    allow_real_submissions: bool = typer.Option(
+        False, "--allow-real-submissions",
+        help="Required for any run without --dry-run. Every submit still needs a per-application human approval."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
+    if approve:
+        # Human-only path: grants exactly one pending submit request (matched by nonce).
+        from applypilot.apply.policy import approve_submission
+        if not nonce or not approve_submission(approve, nonce):
+            console.print("[red]No matching pending submission request.[/red]")
+            raise typer.Exit(code=1)
+        console.print("[green]Submission approved for this one request.[/green]")
+        return
+
     _bootstrap()
 
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
@@ -220,15 +234,16 @@ def apply(
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        console.print("[yellow]For inspection only. Do not run the agent by hand: only the launcher "
+                      "applies the tool restrictions and policy hooks.[/yellow]")
         return
+
+    if not dry_run and not allow_real_submissions:
+        console.print("[red]Real submissions are disabled.[/red] Use --dry-run, or pass "
+                      "--allow-real-submissions for a supervised run (each submit then waits for "
+                      "`applypilot apply --approve <session> --nonce <id>`).")
+        raise typer.Exit(code=1)
 
     from applypilot.apply.launcher import main as apply_main
 

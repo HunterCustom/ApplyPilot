@@ -27,6 +27,8 @@ from rich.live import Live
 from applypilot import config, eligibility
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, dry_run_guard, prompt as prompt_mod
+from applypilot.apply import policy as policy_mod, verification_mcp
+from applypilot.apply.redact import Redactor
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -77,24 +79,37 @@ def _install_exit_hooks() -> None:
 # MCP config
 # ---------------------------------------------------------------------------
 
-def _make_mcp_config(cdp_port: int) -> dict:
-    """Build MCP config dict for a specific CDP port."""
-    return {
-        "mcpServers": {
-            "playwright": {
-                "command": "npx",
-                "args": [
-                    "@playwright/mcp@latest",
-                    f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    f"--viewport-size={config.DEFAULTS['viewport']}",
-                ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
-        }
+# Exact versions: never fetch @latest at run time (supply-chain drift, E3).
+PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.86"
+
+
+def verification_enabled() -> bool:
+    """The verification-code helper is offered only when readonly credentials are configured."""
+    return verification_mcp.credentials_path().exists()
+
+
+def _make_mcp_config(cdp_port: int, policy_path: Path | None = None,
+                     verify_enabled: bool = False) -> dict:
+    """MCP servers for one apply session: the pinned browser and, optionally, the
+    narrow verification-code helper. There is no general email server (S3)."""
+    servers = {
+        "playwright": {
+            "command": "npx",
+            "args": [
+                "-y", PLAYWRIGHT_MCP_PACKAGE,
+                f"--cdp-endpoint=http://127.0.0.1:{cdp_port}",
+                f"--viewport-size={config.DEFAULTS['viewport']}",
+            ],
+        },
     }
+    if verify_enabled:
+        if policy_path is None:
+            raise ValueError("the verification helper needs the session policy file")
+        servers["applypilot_verify"] = {
+            "command": sys.executable,
+            "args": ["-m", "applypilot.apply.verification_mcp", str(policy_path)],
+        }
+    return {"mcpServers": servers}
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +121,19 @@ def _make_mcp_config(cdp_port: int) -> dict:
 #   'dry_run'                         -> eligible for real runs; skipped by dry-run batches
 #   'in_progress'                     -> claimed by a worker (agent_id marks dry-run claims)
 #   'applied'                         -> terminal; only set by a real run or --mark-applied
-#   'needs_review'                    -> outcome unknown (agent may have submitted); a human
-#                                        must resolve it with --mark-applied / --mark-failed
+#   'needs_review'                    -> outcome unknown (agent may have submitted) or a human
+#                                        action is needed (apply_error 'human:<reason>'); a human
+#                                        must resolve it with --mark-applied / --mark-failed.
+#                                        Dry runs land here too when their outcome is uncertain,
+#                                        they were interrupted after the agent started, or the
+#                                        policy hook recorded a violation -- never requeued.
 #   'manual'                          -> ATS requires manual handling
+# Agent failure reasons that need a human (account creation, email-only application, an
+# unanswerable question, a refused submission approval). Real runs -> needs_review.
+HUMAN_ACTION_FAILURES = {
+    "account_required", "email_application", "email_verification_required", "needs_human",
+    "needs_human_answer", "submit_not_approved", "policy_violation",
+}
 # Statuses that block acquisition of any other row sharing the same application_url.
 DUPLICATE_BLOCKING_STATUSES = ("applied", "in_progress", "needs_review")
 DRY_RUN_AGENT_SUFFIX = ":dry_run"
@@ -345,19 +370,26 @@ def record_outcome(url: str, result: str, dry_run: bool,
     go to human review instead of being retried.
     """
     if dry_run:
-        if result == "uncertain:dry_run_submit_not_blocked":
+        # The dry-run guard is best-effort: any uncertain dry-run outcome (or an agent
+        # claiming APPLIED) may hide a real submission, so it is never requeued.
+        if result == "applied":
+            result = "uncertain:applied_claimed_in_dry_run"
+        if result.startswith("uncertain:"):
             status, note, outcome = "needs_review", result, "needs_review"
         else:
-            note = None if result in ("applied", "dry_run") else f"dry_run:{result}"
+            note = None if result == "dry_run" else f"dry_run:{result}"
             status, outcome = "dry_run", "dry_run"
         written = mark_result(url, status, note, duration_ms=duration_ms, owner=owner)
         return outcome if written else "ownership_lost"
     if result == "dry_run":
         result = "uncertain:unexpected_dry_run_result"
+    reason_only = result.split(":", 1)[-1].lower() if result.startswith("failed:") else ""
     if result == "applied":
         status, error, permanent, outcome = "applied", None, False, "applied"
     elif result.startswith("uncertain:"):
         status, error, permanent, outcome = "needs_review", result, False, "needs_review"
+    elif reason_only in HUMAN_ACTION_FAILURES:
+        status, error, permanent, outcome = "needs_review", f"human:{reason_only}", False, "needs_review"
     else:
         reason = result.split(":", 1)[-1] if ":" in result else result
         status, error, permanent, outcome = "failed", reason, _is_permanent_failure(result), "failed"
@@ -369,9 +401,9 @@ def record_outcome(url: str, result: str, dry_run: bool,
 def recover_stale_locks(max_age_seconds: int | None = None) -> int:
     """Resolve 'in_progress' claims left behind by crashed or killed workers.
 
-    Dry-run claims are released back to the queue. Real claims become
-    'needs_review': the agent may have submitted before dying, so retrying
-    automatically could produce a duplicate application.
+    Every stale claim -- real or dry run -- becomes 'needs_review': the agent
+    may have submitted before dying (the dry-run guard is best-effort), so
+    retrying automatically could produce a duplicate application.
 
     Returns:
         Number of rows recovered.
@@ -385,10 +417,9 @@ def recover_stale_locks(max_age_seconds: int | None = None) -> int:
              " AND (agent_id IS NULL OR agent_id NOT LIKE ?)")
     own = f"{SESSION_ID}:%"
     conn = get_connection()
-    released = conn.execute(f"""
-        UPDATE jobs SET apply_status = NULL, agent_id = NULL
-        WHERE {stale} AND agent_id LIKE ?
-    """, (cutoff, own, f"%{DRY_RUN_AGENT_SUFFIX}")).rowcount
+    # Dry-run claims are flagged too: we cannot tell whether the agent had started,
+    # and the dry-run guard does not prove that nothing was submitted.
+    released = 0
     flagged = conn.execute(f"""
         UPDATE jobs SET apply_status = 'needs_review',
                        apply_error = 'uncertain:interrupted_stale_lock', agent_id = NULL
@@ -551,17 +582,32 @@ def parse_agent_result(final_text: str | None) -> str:
 
 def classify_session(final_text: str | None, *, final_is_error: bool, dry_run: bool,
                      submit_attempts: int, unblocked_submits: int,
-                     watchdog_fired: bool = False, interrupted: bool = False) -> str:
+                     watchdog_fired: bool = False, interrupted: bool = False,
+                     security_failure: str | None = None, tool_uses: int = 0,
+                     audit_result: str | None = None,
+                     submit_approved: bool = False, confirmation_seen: bool = False) -> str:
     """Combine the agent's final reply with launcher observations into one result.
 
     The agent's own claim is never enough on its own:
+    - the security configuration could not be verified -> failed if the agent
+      never used a tool, otherwise uncertain;
+    - the policy hook audit found a violation or a tool call without a hook
+      decision -> uncertain (possible injection / unenforced policy);
     - a session killed by the watchdog / interrupted, or one that ended in an
       agent error, is uncertain unless it produced a clean result;
+    - in a real run, APPLIED needs independent evidence: a human-approved
+      submit action plus confirmation text seen afterwards; otherwise uncertain;
     - in a real run, any non-APPLIED result after a submit-like action means
       a submission may have happened -> uncertain (human review);
-    - in a dry run, a submit-like action the guard did not block means a real
-      submission may have happened -> 'uncertain:dry_run_submit_not_blocked'.
+    - in a dry run, a submit-like action the guard did not block, or an agent
+      claiming APPLIED, means a real submission may have happened -> uncertain.
     """
+    if security_failure:
+        if tool_uses:
+            return "uncertain:security_config_unverified"
+        return "failed:security_config_unverified"
+    if audit_result:
+        return audit_result
     result = parse_agent_result(final_text)
     if watchdog_fired:
         result = "uncertain:watchdog_timeout"
@@ -572,7 +618,11 @@ def classify_session(final_text: str | None, *, final_is_error: bool, dry_run: b
     if dry_run:
         if unblocked_submits:
             return "uncertain:dry_run_submit_not_blocked"
+        if result == "applied":
+            return "uncertain:applied_claimed_in_dry_run"
         return result
+    if result == "applied" and not (submit_attempts and submit_approved and confirmation_seen):
+        return "uncertain:applied_without_evidence"
     if submit_attempts and result != "applied" and not result.startswith("uncertain:"):
         return f"uncertain:after_submit_action:{result}"
     return result
@@ -589,53 +639,158 @@ def is_submit_action(tool_name: str, tool_input: dict) -> bool:
     return False
 
 
-GMAIL_ALWAYS_DISALLOWED = (
-    "mcp__gmail__modify_email", "mcp__gmail__delete_email", "mcp__gmail__download_attachment",
-    "mcp__gmail__batch_modify_emails", "mcp__gmail__batch_delete_emails",
-    "mcp__gmail__create_label", "mcp__gmail__update_label", "mcp__gmail__delete_label",
-    "mcp__gmail__get_or_create_label", "mcp__gmail__list_email_labels",
-    "mcp__gmail__create_filter", "mcp__gmail__list_filters", "mcp__gmail__get_filter",
-    "mcp__gmail__delete_filter", "mcp__gmail__draft_email",
-)
-GMAIL_DRY_RUN_DISALLOWED = ("mcp__gmail__send_email",)
+EXPECTED_MCP_SERVERS = {"playwright", "applypilot_verify"}
+HOOK_TIMEOUT_S = 900  # covers the real-run human approval wait
 
 
-def dry_run_guard_settings() -> dict:
-    """Claude Code settings that install the dry-run PreToolUse guard hook."""
-    command = f'"{sys.executable}" -m applypilot.apply.dry_run_guard'
-    return {"hooks": {"PreToolUse": [
-        {"matcher": "mcp__playwright__.*|mcp__gmail__.*",
-         "hooks": [{"type": "command", "command": command}]},
-    ]}}
+def policy_hook_settings(policy_path: Path) -> dict:
+    """Claude Code settings installing the session policy hooks for every tool call."""
+    base = f'"{sys.executable}" -m applypilot.apply.policy_hook'
+    pp = f'"{policy_path}"'
+    return {"hooks": {
+        "SessionStart": [{"hooks": [{"type": "command", "command": f"{base} start {pp}"}]}],
+        "PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": f"{base} pre {pp}", "timeout": HOOK_TIMEOUT_S}]}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": f"{base} post {pp}"}]}],
+    }}
 
 
 def build_agent_command(model: str, mcp_config_path: Path, dry_run: bool,
-                        settings_path: Path | None = None) -> list[str]:
-    """Build the Claude Code command line for one application session.
+                        settings_path: Path | None = None,
+                        verify_enabled: bool = False) -> list[str]:
+    """Build the least-privilege Claude Code command line for one application (S1).
 
-    --strict-mcp-config keeps the user's own MCP servers out of the agent.
-    Dry runs additionally block email sending outright and install the
-    dry-run guard hook (settings_path) that refuses submit-like tool calls.
+    - ``--tools ""``: no built-in tools at all (no shell, files, web fetch, subagents).
+    - ``--setting-sources ""``: none of the user's settings, plugins, hooks or skills.
+    - ``--strict-mcp-config``: only the browser (+ verification helper) MCP servers.
+    - ``--permission-mode dontAsk`` + ``--allowedTools``: anything not listed is denied.
+    - ``--disallowedTools``: known-dangerous tools denied explicitly as well.
+    - ``--settings``: the policy hooks (navigation/upload/value policy, dry-run guard,
+      real-run submit approval). Required for every run; refuse to build without it.
+    ``dry_run`` only changes the policy file, not the command line.
     """
-    disallowed = list(GMAIL_ALWAYS_DISALLOWED)
-    if dry_run:
-        disallowed += GMAIL_DRY_RUN_DISALLOWED
-    cmd = [
+    if settings_path is None:
+        raise ValueError("apply sessions require the policy hook settings file")
+    return [
         "claude",
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
         "--strict-mcp-config",
-        "--permission-mode", "bypassPermissions",
+        "--tools", "",
+        "--setting-sources", "",
+        "--permission-mode", "dontAsk",
+        "--allowedTools", ",".join(policy_mod.allowed_tool_names(verify_enabled)),
+        "--disallowedTools", ",".join(policy_mod.denied_tool_names()),
+        "--disable-slash-commands",
         "--no-session-persistence",
-        "--disallowedTools", ",".join(disallowed),
+        "--settings", str(settings_path),
+        "--output-format", "stream-json", "--verbose", "-",
     ]
-    if dry_run:
-        if settings_path is None:
-            raise ValueError("dry runs require the guard settings file")
-        cmd += ["--settings", str(settings_path)]
-    cmd += ["--output-format", "stream-json", "--verbose", "-"]
-    return cmd
+
+
+def check_agent_cli(help_text: str | None = None) -> str | None:
+    """Fail closed if the installed Claude Code cannot enforce the restrictions.
+
+    Returns None when every required flag exists, else a reason string.
+    """
+    if help_text is None:
+        try:
+            help_text = subprocess.run(["claude", "--help"], capture_output=True, text=True, check=False,
+                                       encoding="utf-8", errors="replace", timeout=60).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"cannot run claude --help ({type(e).__name__})"
+    required = ("--tools", "--setting-sources", "--strict-mcp-config", "--allowedTools",
+                "--disallowedTools", "--settings", "dontAsk", "--disable-slash-commands")
+    missing = [f for f in required if f not in (help_text or "")]
+    return f"installed Claude Code lacks: {', '.join(missing)}" if missing else None
+
+
+def verify_init_event(msg: dict, verify_enabled: bool) -> str | None:
+    """Check the session's actual tool surface (stream-json init event). None = OK.
+
+    Any deviation kills the session before the agent acts.
+    """
+    if msg.get("permissionMode") != "dontAsk":
+        return f"permission mode is {msg.get('permissionMode')!r}"
+    for tool in msg.get("tools") or []:
+        if not tool.startswith((policy_mod.PLAYWRIGHT_PREFIX, policy_mod.VERIFY_PREFIX)):
+            return f"unexpected tool {tool!r}"
+    servers = {s.get("name"): s.get("status") for s in msg.get("mcp_servers") or []}
+    if set(servers) - EXPECTED_MCP_SERVERS:
+        return f"unexpected MCP servers {sorted(set(servers) - EXPECTED_MCP_SERVERS)}"
+    if servers.get("playwright") != "connected":
+        return "browser MCP server not connected"
+    if verify_enabled and servers.get("applypilot_verify") != "connected":
+        return "verification helper not connected"
+    if not verify_enabled and "applypilot_verify" in servers:
+        return "verification helper present but not enabled"
+    for plugin in msg.get("plugins") or []:
+        if not str(plugin.get("source", "")).endswith("@builtin"):
+            return f"unexpected plugin {plugin.get('name')!r}"
+    if msg.get("skills"):
+        return "skills are loaded"
+    return None
+
+
+def audit_session(session_dir: Path, tool_uses: int) -> str | None:
+    """Post-session audit of the hook records. Returns an uncertain:* result or None."""
+    audit = policy_mod.read_jsonl(session_dir / "audit.jsonl")
+    violations = policy_mod.read_jsonl(session_dir / "violations.jsonl")
+    pre = sum(1 for r in audit if r.get("phase") == "pre")
+    if tool_uses and not (session_dir / "hook_alive").exists():
+        return "uncertain:policy_hook_not_active"
+    if pre < tool_uses:
+        return "uncertain:policy_hook_not_enforced"
+    if violations:
+        return "uncertain:policy_violation"
+    return None
+
+
+def submission_evidence(session_dir: Path) -> tuple[bool, bool]:
+    """(a human approved a submit action, confirmation text was seen after it)."""
+    audit = policy_mod.read_jsonl(session_dir / "audit.jsonl")
+    approved = any(r.get("submit_approved") for r in audit)
+    confirmed = any(r.get("evidence") == "confirmation_text" for r in audit)
+    return approved, confirmed
+
+
+_SECRET_ENV_RE = re.compile(r"(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.IGNORECASE)
+_AGENT_AUTH_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def agent_env() -> dict:
+    """Environment for the agent process: no ApplyPilot / third-party secrets.
+
+    Only Claude Code's own authentication variables survive; LLM keys loaded
+    from ApplyPilot's .env (Gemini, OpenAI, ...) and other secrets are dropped.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k in _AGENT_AUTH_ENV or not _SECRET_ENV_RE.search(k)}
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    env.pop("APPLYPILOT_GMAIL_CREDENTIALS", None)
+    return env
+
+
+def new_session_dir(worker_id: int) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    d = config.APP_DIR / "apply-sessions" / f"w{worker_id}_{ts}_{uuid.uuid4().hex[:6]}"
+    (d / "uploads").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def build_session_policy(job: dict, session: Path, dry_run: bool,
+                         verify_enabled: bool) -> policy_mod.SessionPolicy:
+    hosts = policy_mod.session_allowed_hosts(job)
+    uploads = sorted(str(p.resolve()) for p in (session / "uploads").glob("*.pdf"))
+    sender_domains = sorted({h[2:] if h.startswith("*.") else policy_mod.base_domain(h) for h in hosts})
+    return policy_mod.SessionPolicy(
+        session_dir=str(session), dry_run=dry_run, allowed_hosts=hosts, upload_paths=uploads,
+        verify_enabled=verify_enabled, verify_sender_domains=sender_domains,
+        require_submit_approval=not dry_run,
+    )
 
 
 def run_job(job: dict, port: int, worker_id: int = 0,
@@ -654,26 +809,31 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    # Build the prompt
+    # Per-session directory (outside the agent's cwd): policy, hook audit, uploads.
+    session = new_session_dir(worker_id)
+    upload_dir = session / "uploads"
+    verify_enabled = verification_enabled()
+
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        upload_dir=upload_dir,
+        verify_enabled=verify_enabled,
     )
 
-    # Write per-worker MCP config
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+    policy = build_session_policy(job, session, dry_run, verify_enabled)
+    policy_path = policy.write()
 
-    settings_path = None
-    if dry_run:
-        settings_path = config.APP_DIR / f".apply-dry-run-settings-{worker_id}.json"
-        settings_path.write_text(json.dumps(dry_run_guard_settings()), encoding="utf-8")
-    cmd = build_agent_command(model, mcp_config_path, dry_run, settings_path)
+    mcp_config_path = session / "mcp.json"
+    mcp_config_path.write_text(json.dumps(_make_mcp_config(port, policy_path, verify_enabled)),
+                               encoding="utf-8")
+    settings_path = session / "settings.json"
+    settings_path.write_text(json.dumps(policy_hook_settings(policy_path)), encoding="utf-8")
+    cmd = build_agent_command(model, mcp_config_path, dry_run, settings_path, verify_enabled)
 
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    env = agent_env()
+    redact = Redactor(config.load_profile(), secrets_file=session / "secrets.txt")
 
     worker_dir = reset_worker_dir(worker_id)
 
@@ -732,23 +892,40 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         final_is_error = False
         submit_ids: set[str] = set()  # tool_use ids of submit-like actions
         guard_blocked_ids: set[str] = set()  # ids the dry-run guard refused
+        tool_uses = 0
+        security_failure: str | None = None
         with open(worker_log, "a", encoding="utf-8") as lf:
-            lf.write(log_header)
+            lf.write(redact(log_header))
 
             for line in proc.stdout:
+                if security_failure:
+                    break
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     msg = json.loads(line)
                     msg_type = msg.get("type")
-                    if msg_type == "assistant":
+                    if msg_type == "system" and msg.get("subtype") == "init":
+                        security_failure = verify_init_event(msg, verify_enabled)
+                        if security_failure:
+                            lf.write(f"  !! security configuration not enforced: {security_failure}\n")
+                            _kill_process_tree(proc.pid)
+                            break
+                    elif msg_type == "assistant":
                         for block in msg.get("message", {}).get("content", []):
                             bt = block.get("type")
                             if bt == "text":
                                 text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
+                                lf.write(redact(block["text"]) + "\n")
                             elif bt == "tool_use":
+                                tool_uses += 1
+                                if tool_uses == 1 and not (session / "hook_alive").exists():
+                                    # SessionStart runs before the first turn; no canary = no policy.
+                                    security_failure = "policy hooks are not active"
+                                    lf.write("  !! policy hooks are not active; stopping session\n")
+                                    _kill_process_tree(proc.pid)
+                                    break
                                 name = (
                                     block.get("name", "")
                                     .replace("mcp__playwright__", "")
@@ -766,7 +943,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 else:
                                     desc = name
 
-                                lf.write(f"  >> {desc}\n")
+                                lf.write(f"  >> {redact(desc)}\n")
                                 if is_submit_action(block.get("name", ""), inp):
                                     submit_ids.add(block.get("id", f"anon-{len(submit_ids)}"))
                                     lf.write("  !! submit-like action\n")
@@ -794,7 +971,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 guard_blocked_ids.add(block.get("tool_use_id", ""))
                 except json.JSONDecodeError:
                     text_parts.append(line)
-                    lf.write(line + "\n")
+                    lf.write(redact(line) + "\n")
 
         proc.wait(timeout=config.DEFAULTS["apply_timeout"])
         returncode = proc.returncode
@@ -806,7 +983,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
+        job_log.write_text(redact(output), encoding="utf-8")
+        (session / "secrets.txt").unlink(missing_ok=True)  # codes are only needed for redaction
 
         if stats:
             cost = stats.get("cost_usd", 0)
@@ -814,12 +992,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
 
+        approved, confirmed = submission_evidence(session)
         result = classify_session(
             final_text, final_is_error=final_is_error, dry_run=dry_run,
             submit_attempts=len(submit_ids),
             unblocked_submits=len(submit_ids - guard_blocked_ids),
             watchdog_fired=watchdog_fired.is_set(),
             interrupted=bool(returncode and returncode < 0),
+            security_failure=security_failure, tool_uses=tool_uses,
+            audit_result=audit_session(session, tool_uses),
+            submit_approved=approved, confirmation_seen=confirmed,
         )
 
         label, _, detail = result.partition(":")
@@ -842,6 +1024,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             return f"failed:launch_error:{str(e)[:80]}", duration_ms
         return f"uncertain:error:{str(e)[:80]}", duration_ms
     finally:
+        (session / "secrets.txt").unlink(missing_ok=True)
         if watchdog is not None:
             watchdog.cancel()
         with _claude_lock:
@@ -884,15 +1067,15 @@ def _release_interrupted(url: str, worker_id: int, dry_run: bool, reason: str,
                          owner: str | None = None) -> None:
     """Handle a job abandoned mid-flight (Ctrl+C or launcher error).
 
-    If the agent never started, or this is a dry run, the claim is simply
-    released. Otherwise the agent may already have submitted, so the job is
-    flagged for human review rather than silently returned to the queue.
-    Only this worker's own claim (owner) is ever touched.
+    If the agent never started, the claim is simply released. Otherwise the
+    agent may already have submitted -- also in a dry run, whose guard is
+    best-effort -- so the job is flagged for human review rather than silently
+    returned to the queue. Only this worker's own claim (owner) is ever touched.
     """
     with _claude_lock:
         started = worker_id in _agent_started
-    if started and not dry_run:
-        mark_result(url, "needs_review", reason, owner=owner)
+    if started:
+        mark_result(url, "needs_review", f"{reason}{':dry_run' if dry_run else ''}", owner=owner)
     else:
         release_lock(url, owner=owner)
 
@@ -1024,6 +1207,13 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+
+    # Fail closed: never start an agent the installed CLI cannot restrict (S1).
+    problem = check_agent_cli()
+    if problem:
+        console.print(f"[red]Refusing to run: {problem}. The apply agent's tool restrictions "
+                      "cannot be enforced.[/red]")
+        return
     _install_exit_hooks()
 
     recovered = recover_stale_locks()
