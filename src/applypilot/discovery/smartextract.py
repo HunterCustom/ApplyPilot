@@ -30,7 +30,8 @@ from playwright.sync_api import sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import get_connection, init_db, store_jobs, get_stats, record_sighting
+from applypilot.dates import iso_date as _iso_date
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -116,6 +117,8 @@ def _store_jobs_filtered(
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+        record_sighting(conn, url, site, company=job.get("company"), date_posted=_iso_date(job.get("date_posted")),
+                        job_type=job.get("job_type"), now=now)
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)

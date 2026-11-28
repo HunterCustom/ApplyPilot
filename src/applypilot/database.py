@@ -187,7 +187,108 @@ _ALL_COLUMNS: dict[str, str] = {
     "eligibility_tier": "TEXT",
     "eligibility_version": "TEXT",
     "eligibility_at": "TEXT",
+    # --- Fork additions (all additive; see DEPLOYMENT.md "Database migration") ---
+    # Discovery history: when/how often/where a posting was seen
+    "company": "TEXT",
+    "job_type": "TEXT",
+    "date_posted": "TEXT",          # only as reported by the source; never invented
+    "first_seen_at": "TEXT",
+    "last_seen_at": "TEXT",
+    "seen_count": "INTEGER DEFAULT 0",
+    "requisition_id": "TEXT",
+    # Posting verification (applypilot.verify)
+    "posting_status": "TEXT",       # active | closed | removed | inaccessible | uncertain
+    "posting_reason": "TEXT",
+    "posting_http_status": "INTEGER",
+    "posting_checked_at": "TEXT",
+    "posting_verified_url": "TEXT",
+    # Cross-source duplicates (applypilot.dedupe)
+    "dedupe_key": "TEXT",
+    "duplicate_of": "TEXT",
+    "duplicate_reason": "TEXT",
+    # Scoring traceability
+    "score_model": "TEXT",
+    "score_config": "TEXT",
+    "score_error": "TEXT",
+    "score_attempts": "INTEGER DEFAULT 0",
+    # Document validation (resume + cover letter)
+    "resume_validation": "TEXT",    # passed | rejected | needs_review
+    "resume_validation_reasons": "TEXT",
+    "resume_model": "TEXT",
+    "resume_rejected_path": "TEXT",
+    "cover_validation": "TEXT",
+    "cover_validation_reasons": "TEXT",
+    "cover_model": "TEXT",
+    "cover_rejected_path": "TEXT",
+    "documents_for": "TEXT",        # fingerprint of the job text the documents were made from
+    # Screening questions (applypilot.screening)
+    "screening_status": "TEXT",     # supported | needs_review | none
+    "screening_report": "TEXT",
+    # Readiness + human review (applypilot.readiness)
+    "readiness": "TEXT",            # ready | blocked
+    "readiness_reasons": "TEXT",
+    "readiness_at": "TEXT",
+    "review_status": "TEXT",        # approved | rejected | deferred | manual_submitted
+    "review_note": "TEXT",
+    "reviewed_at": "TEXT",
 }
+
+# Auxiliary tables (created if missing; never dropped).
+_AUX_TABLES = (
+    """CREATE TABLE IF NOT EXISTS job_sources (
+        url TEXT NOT NULL, source TEXT NOT NULL, source_url TEXT,
+        first_seen_at TEXT, last_seen_at TEXT, seen_count INTEGER DEFAULT 0,
+        PRIMARY KEY (url, source))""",
+    """CREATE TABLE IF NOT EXISTS discovery_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, source TEXT, query TEXT,
+        started_at TEXT, finished_at TEXT, status TEXT, new_count INTEGER DEFAULT 0,
+        seen_count INTEGER DEFAULT 0, error TEXT)""",
+    """CREATE TABLE IF NOT EXISTS score_history (
+        url TEXT NOT NULL, fit_score INTEGER, score_reasoning TEXT, scored_at TEXT, score_model TEXT,
+        score_config TEXT, replaced_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS pipeline_runs (
+
+        run_id TEXT PRIMARY KEY, kind TEXT, started_at TEXT, finished_at TEXT, status TEXT,
+        exit_code INTEGER, summary TEXT)""",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_key ON jobs(dedupe_key)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_application_url ON jobs(application_url)",
+)
+
+
+def ensure_aux_tables(conn: sqlite3.Connection) -> None:
+    for sql in _AUX_TABLES:
+        conn.execute(sql)
+    conn.commit()
+
+
+def record_sighting(conn: sqlite3.Connection, url: str, source: str, *, company: str | None = None,
+                    date_posted: str | None = None, job_type: str | None = None,
+                    source_url: str | None = None, now: str | None = None) -> None:
+    """Persistent discovery history for one posting seen by one source (new or already known).
+
+    Only fills fields that are still empty (first source wins) and never overwrites a stored
+    posting date. ``date_posted`` must come from the source itself -- callers never guess it."""
+    now = now or datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET first_seen_at = COALESCE(first_seen_at, discovered_at, ?), last_seen_at = ?,"
+        " seen_count = COALESCE(seen_count, 0) + 1, company = COALESCE(company, ?),"
+        " date_posted = COALESCE(date_posted, ?), job_type = COALESCE(job_type, ?) WHERE url = ?",
+        (now, now, company or None, date_posted or None, job_type or None, url))
+    conn.execute(
+        "INSERT INTO job_sources (url, source, source_url, first_seen_at, last_seen_at, seen_count)"
+        " VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(url, source) DO UPDATE SET last_seen_at = excluded.last_seen_at,"
+        " seen_count = job_sources.seen_count + 1", (url, source or "unknown", source_url or url, now, now))
+
+
+def log_discovery_run(conn: sqlite3.Connection, *, run_id: str, source: str, query: str = "",
+                      started_at: str, status: str, new_count: int = 0, seen_count: int = 0,
+                      error: str | None = None) -> None:
+    conn.execute(
+        "INSERT INTO discovery_runs (run_id, source, query, started_at, finished_at, status, new_count,"
+        " seen_count, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, source, query, started_at, datetime.now(timezone.utc).isoformat(), status, new_count,
+         seen_count, (error or "")[:500] or None))
+    conn.commit()
 
 
 def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
@@ -222,6 +323,7 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
 
     if added:
         conn.commit()
+    ensure_aux_tables(conn)
 
     return added
 
@@ -378,6 +480,8 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+        record_sighting(conn, url, site, company=job.get("company"), date_posted=job.get("date_posted"),
+                        job_type=job.get("job_type"), now=now)
 
     conn.commit()
     return new, existing
@@ -408,12 +512,21 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "pending_detail": "detail_scraped_at IS NULL",
         "enriched": "full_description IS NOT NULL",
         # Ineligible jobs never consume LLM scoring; unknown/review jobs are still scored.
-        "pending_score": f"full_description IS NOT NULL AND fit_score IS NULL AND {SQL_NOT_INELIGIBLE}",
+        # Duplicates of another row and postings confirmed closed/removed are skipped; a job whose
+        # scoring failed 5 times stops being retried automatically (see score_error).
+        "pending_score": (
+            f"full_description IS NOT NULL AND fit_score IS NULL AND {SQL_NOT_INELIGIBLE} "
+            "AND duplicate_of IS NULL AND COALESCE(score_attempts, 0) < 5 "
+            "AND (posting_status IS NULL OR posting_status NOT IN ('closed', 'removed'))"
+        ),
         "scored": "fit_score IS NOT NULL",
         # Tailoring and applying require verified eligibility.
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            f"AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5 AND {SQL_ELIGIBLE}"
+            f"AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5 AND {SQL_ELIGIBLE} "
+            # documents are prepared only for live, non-duplicate postings (applypilot.verify / dedupe)
+            "AND posting_status = 'active' AND duplicate_of IS NULL "
+            "AND COALESCE(resume_validation, '') != 'needs_review'"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (

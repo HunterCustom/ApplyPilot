@@ -170,11 +170,21 @@ _NO_DUPLICATE_CLAUSE = f"""NOT EXISTS (
     )"""
 
 
+# Fork: only application-ready jobs are claimed (applypilot.readiness); a real submission also
+# needs the human review approval. Readiness is re-evaluated after the claim (worker_loop).
+_READY_CLAUSE = "j.readiness = 'ready' AND j.duplicate_of IS NULL"
+_APPROVED_CLAUSE = "j.review_status = 'approved'"
+
+
+def _ready_clause(dry_run: bool) -> str:
+    return _READY_CLAUSE if dry_run else f"{_READY_CLAUSE} AND {_APPROVED_CLAUSE}"
+
+
 def _like_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _select_target(conn, target_url: str):
+def _select_target(conn, target_url: str, dry_run: bool = False):
     """Find an explicitly requested job by its exact job URL (audit M6: never a fuzzy match).
 
     The target must resolve to exactly one row; an application URL shared by several rows is
@@ -188,6 +198,7 @@ def _select_target(conn, target_url: str):
           AND (j.apply_attempts IS NULL OR j.apply_attempts < ?)
           AND {_ELIGIBLE_CLAUSE}
           AND {_NO_DUPLICATE_CLAUSE}
+          AND {_ready_clause(dry_run)}
         LIMIT 2
     """, (target_url, target_url, target_url, config.DEFAULTS["max_apply_attempts"])).fetchall()
     return rows[0] if len(rows) == 1 else None
@@ -217,6 +228,7 @@ def _select_next(conn, min_score: int, dry_run: bool):
           {url_clauses}
           AND {_ELIGIBLE_CLAUSE}
           AND {_NO_DUPLICATE_CLAUSE}
+          AND {_ready_clause(dry_run)}
         ORDER BY CASE j.eligibility_tier WHEN 'highest' THEN 0 WHEN 'high' THEN 1
                       WHEN 'acceptable' THEN 2 ELSE 3 END,
                  j.fit_score DESC, j.url
@@ -248,7 +260,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     try:
         conn.execute("BEGIN IMMEDIATE")
         while True:
-            row = _select_target(conn, target_url) if target_url else _select_next(conn, min_score, dry_run)
+            row = (_select_target(conn, target_url, dry_run) if target_url
+                   else _select_next(conn, min_score, dry_run))
             if not row:
                 conn.rollback()
                 return None
@@ -286,16 +299,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         raise
 
 
-def explain_target(target_url: str) -> str | None:
+def explain_target(target_url: str, dry_run: bool = False) -> str | None:
     """Why an explicit --url target cannot be acquired, or None if it can (read-only)."""
     conn = get_connection()
     rows = conn.execute("""
         SELECT url, apply_status, tailored_resume_path, eligibility_status, eligibility_reason,
-               eligibility_version
-        FROM jobs WHERE url = ? OR application_url = ?
-    """, (target_url, target_url)).fetchall()
+               eligibility_version, readiness, readiness_reasons, review_status
+        FROM jobs WHERE url = ?
+    """, (target_url,)).fetchall()
     if not rows:
-        return None  # may still match by substring; acquire_job decides
+        return "no job with exactly this URL (use the job URL shown by `applypilot review`)"
     row = rows[0]
     status = row["eligibility_status"]
     if status not in eligibility.ELIGIBLE_STATUSES:
@@ -305,6 +318,10 @@ def explain_target(target_url: str) -> str | None:
         return f"apply status is '{row['apply_status']}'"
     if not row["tailored_resume_path"]:
         return "no tailored resume yet (run `applypilot run tailor`)"
+    if row["readiness"] != "ready":
+        return f"not application-ready: {row['readiness_reasons'] or 'run `applypilot run prepare`'}"
+    if not dry_run and row["review_status"] != "approved":
+        return "not approved in review (check the documents, then `applypilot review --approve URL`)"
     return None
 
 
@@ -1174,7 +1191,24 @@ def _is_permanent_failure(result: str) -> bool:
 # Worker loop
 # ---------------------------------------------------------------------------
 
+def _still_ready(job: dict) -> tuple[bool, list[str]]:
+    from applypilot import readiness
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+    if row is None:
+        return False, ["job row disappeared"]
+    ok, reasons, _ = readiness.evaluate(dict(row), conn)
+    # In flight because *we* just claimed it -- that alone is not a blocker.
+    reasons = [r for r in reasons if r != "application history: status is in_progress"]
+    if reasons:
+        conn.execute("UPDATE jobs SET readiness = 'blocked', readiness_reasons = ? WHERE url = ?",
+                     (json.dumps(reasons), job["url"]))
+        conn.commit()
+    return not reasons, reasons
+
+
 def _release_interrupted(url: str, worker_id: int, dry_run: bool, reason: str,
+
                          owner: str | None = None) -> None:
     """Handle a job abandoned mid-flight (Ctrl+C or launcher error).
 
@@ -1243,6 +1277,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         empty_polls = 0
         with _claude_lock:
             _agent_started.discard(worker_id)
+
+        # Fresh readiness check after the claim (posting, documents, duplicates, history).
+        ready_ok, ready_reasons = _still_ready(job)
+        if not ready_ok:
+            add_event(f"[W{worker_id}] Not ready, released: {'; '.join(ready_reasons)[:60]}")
+            release_lock(job["url"], owner=job["agent_id"])
+            jobs_done += 1
+            continue
 
         chrome_proc = None
         guard = None
@@ -1343,7 +1385,8 @@ def main(limit: int = 1, target_url: str | None = None,
     if reclassified:
         console.print(f"[dim]Eligibility (re)classified: {reclassified}[/dim]")
     if target_url:
-        reason = explain_target(target_url)
+        reason = explain_target(target_url, dry_run=dry_run)
+
         if reason:
             console.print(f"[red]Not applying to {target_url}:[/red] {reason}")
             return

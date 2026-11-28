@@ -7,7 +7,6 @@ profile at runtime. No hardcoded personal information.
 
 import json
 import logging
-import re
 import time
 from datetime import datetime, timezone
 
@@ -120,7 +119,8 @@ def _strip_preamble(text: str) -> str:
 def generate_cover_letter(
     resume_text: str, job: dict, profile: dict,
     max_retries: int = 3, validation_mode: str = "normal",
-) -> str:
+    sources=None, evidence_text: str = "", min_words: int = 120, max_words: int = 320,
+) -> tuple[str, dict]:
     """Generate a cover letter with fresh context on each retry + auto-sanitize.
 
     Same design as tailor_resume: fresh conversation per attempt, issues noted
@@ -134,8 +134,15 @@ def generate_cover_letter(
         validation_mode:  "strict", "normal", or "lenient".
 
     Returns:
-        The cover letter text (best attempt even if validation failed).
+        (letter, report). ``report["status"] == "approved"`` is the only usable outcome
+        (fork): a letter that still fails validation after the last attempt is returned
+        as ``rejected`` and is never marked ready. Grounding (scoring.factcheck) runs in
+        every mode: no unsupported technologies, certifications, metrics or promises.
     """
+    from applypilot.scoring.factcheck import build_sources, cover_letter_problems
+    if sources is None:
+        sources = build_sources(resume_text, profile, {})
+    report: dict = {"attempts": 0, "status": "pending", "errors": [], "validation_mode": validation_mode}
     job_text = (
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
@@ -149,6 +156,7 @@ def generate_cover_letter(
     cl_prompt_base = _build_cover_letter_prompt(profile)
 
     for attempt in range(max_retries + 1):
+        report["attempts"] = attempt + 1
         # Fresh conversation every attempt
         prompt = cl_prompt_base
         if avoid_notes:
@@ -159,8 +167,12 @@ def generate_cover_letter(
         messages = [
             {"role": "system", "content": prompt},
             {"role": "user", "content": (
-                f"RESUME:\n{resume_text}\n\n---\n\n"
-                f"TARGET JOB:\n{job_text}\n\n"
+                f"RESUME:\n{resume_text}\n\n"
+                + (f"USER-VERIFIED EVIDENCE (only these facts; personal projects are not employment):\n"
+                   f"{evidence_text}\n\n" if evidence_text else "")
+                + f"---\n\nTARGET JOB:\n{job_text}\n\n"
+                f"Length: {min_words}-{max_words} words. Name the role and the employer. "
+                "Never promise outcomes or claim anything the resume/evidence does not state.\n"
                 "Write the cover letter:"
             )},
         ]
@@ -170,17 +182,22 @@ def generate_cover_letter(
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 
         validation = validate_cover_letter(letter, mode=validation_mode)
-        if validation["passed"]:
-            return letter
+        problems = cover_letter_problems(letter, {**job, "company": job.get("company") or ""}, sources,
+                                         min_words=min_words, max_words=max_words)
+        report["errors"] = list(validation["errors"]) + problems
+        if validation["passed"] and not problems:
+            report["status"] = "approved"
+            return letter, report
 
-        avoid_notes.extend(validation["errors"])
+        avoid_notes.extend(report["errors"])
         # Warnings never block — only hard errors trigger a retry
         log.debug(
             "Cover letter attempt %d/%d failed: %s",
             attempt + 1, max_retries + 1, validation["errors"],
         )
 
-    return letter  # last attempt even if failed
+    report["status"] = "rejected"
+    return letter, report  # kept only as a rejected artifact
 
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
@@ -200,13 +217,26 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+    from applypilot import opsconfig
+    from applypilot.scoring import documents as D
+    from applypilot.scoring.candidate_evidence import format_candidate_evidence
+    sources = D.truth_sources(profile, resume_text)
+    evidence = D.load_evidence_safe()
+    evidence_text = format_candidate_evidence(evidence) if evidence else ""
+    ops = opsconfig.load()
+    try:
+        model = get_client().model
+    except Exception:  # noqa: BLE001
+        model = "unknown"
 
-    # Fetch jobs that have tailored resumes but no cover letter yet
+    # Jobs with an approved tailored resume but no cover letter yet
     jobs = conn.execute(
         "SELECT * FROM jobs "
         "WHERE fit_score >= ? AND tailored_resume_path IS NOT NULL "
+        "AND COALESCE(resume_validation, 'passed') = 'passed' "
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
+        "AND COALESCE(cover_validation, '') != 'needs_review' "
         "AND COALESCE(cover_attempts, 0) < ? "
         "ORDER BY fit_score DESC LIMIT ?",
         (min_score, MAX_ATTEMPTS, limit),
@@ -234,24 +264,22 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     for job in jobs:
         completed += 1
         try:
-            letter = generate_cover_letter(resume_text, job, profile,
-                                          validation_mode=validation_mode)
+            letter, report = generate_cover_letter(
+                resume_text, job, profile, validation_mode=validation_mode, sources=sources,
+                evidence_text=evidence_text, min_words=int(ops.get("cover_min_words", 120)),
+                max_words=int(ops.get("cover_max_words", 320)))
+            report["model"] = model
+            approved = report["status"] == "approved"
+            cl_path = D.save_artifact(COVER_LETTER_DIR, D.safe_prefix(job), "_CL", letter, report, approved)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
-
-            cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
-            cl_path.write_text(letter, encoding="utf-8")
-
-            # Generate PDF (best-effort)
+            # PDF only for approved letters (best-effort)
             pdf_path = None
-            try:
-                from applypilot.scoring.pdf import convert_to_pdf
-                pdf_path = str(convert_to_pdf(cl_path))
-            except Exception:
-                log.debug("PDF generation failed for %s", cl_path, exc_info=True)
+            if approved:
+                try:
+                    from applypilot.scoring.pdf import convert_to_pdf
+                    pdf_path = str(convert_to_pdf(cl_path))
+                except Exception:
+                    log.debug("PDF generation failed for %s", cl_path, exc_info=True)
 
             result = {
                 "url": job["url"],
@@ -259,6 +287,8 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
                 "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
+                "approved": approved,
+                "errors": report.get("errors", []),
             }
             results.append(result)
 
@@ -281,14 +311,22 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     now = datetime.now(timezone.utc).isoformat()
     saved = 0
     for r in results:
-        if r.get("path"):
+        if r.get("path") and r.get("approved"):
             conn.execute(
-                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
+                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, cover_validation='passed', "
+                "cover_validation_reasons=NULL, cover_model=?, "
                 "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
+                (r["path"], now, model, r["url"]),
             )
             saved += 1
+        elif r.get("path"):
+            conn.execute(
+                "UPDATE jobs SET cover_validation='rejected', cover_validation_reasons=?, cover_rejected_path=?, "
+                "cover_model=?, cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                (json.dumps(r.get("errors", [])[:15]), r["path"], model, r["url"]),
+            )
         else:
+
             conn.execute(
                 "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
                 (r["url"],),

@@ -15,12 +15,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from applypilot import config
 from applypilot.config import load_env, ensure_dirs
 from applypilot.database import init_db, get_connection, get_stats
 from applypilot.eligibility import SQL_ELIGIBLE, SQL_NOT_INELIGIBLE
@@ -33,15 +34,19 @@ console = Console()
 # Stage definitions
 # ---------------------------------------------------------------------------
 
-STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+STAGE_ORDER = ("discover", "enrich", "verify", "dedupe", "classify", "score", "tailor", "cover", "pdf", "prepare")
 
 STAGE_META: dict[str, dict] = {
     "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
+    "verify":   {"desc": "Posting verification (still open? freshness)"},
+    "dedupe":   {"desc": "Cross-source duplicate detection"},
+    "classify": {"desc": "Deterministic geographic eligibility"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
     "cover":    {"desc": "Cover letter generation"},
     "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
+    "prepare":  {"desc": "Application readiness + review queue"},
 }
 
 # Upstream dependency: a stage only finishes when its upstream is done AND
@@ -49,10 +54,14 @@ STAGE_META: dict[str, dict] = {
 _UPSTREAM: dict[str, str | None] = {
     "discover": None,
     "enrich":   "discover",
-    "score":    "enrich",
+    "verify":   "enrich",
+    "dedupe":   "verify",
+    "classify": "dedupe",
+    "score":    "classify",
     "tailor":   "score",
     "cover":    "tailor",
     "pdf":      "cover",
+    "prepare":  "pdf",
 }
 
 
@@ -60,44 +69,86 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
+def _discovery_sources() -> list[str]:
+    """Enabled sources: searches.yaml ``discovery: sources: [...]`` (default: all three)."""
+    try:
+        cfg = (config.load_search_config() or {}).get("discovery") or {}
+    except Exception:  # noqa: BLE001 -- unreadable config: keep the upstream default
+        cfg = {}
+    allowed = ("jobspy", "workday", "smartextract")
+    chosen = [s for s in (cfg.get("sources") or allowed) if s in allowed]
+    return chosen or list(allowed)
+
+
 def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    """Stage: Job discovery. Each source runs isolated: one failing never stops the others.
 
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
-    try:
+    Every source run is recorded in ``discovery_runs`` (status, new/seen counts, error), and
+    every sighting in ``job_sources`` / ``first_seen_at`` / ``last_seen_at`` (incremental history)."""
+    import uuid
+
+    from applypilot.database import log_discovery_run
+    stats: dict = {}
+    run_id = uuid.uuid4().hex[:12]
+
+    def _jobspy():
         from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
+        return run_discovery()
 
-    # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
+    def _workday():
         from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
+        return run_workday_discovery(workers=workers)
 
-    # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
-    try:
+    def _smart():
         from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
-    except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
+        return run_smart_extract(workers=workers)
 
+    runners = {"jobspy": ("JobSpy full crawl", _jobspy), "workday": ("Workday corporate scraper", _workday),
+               "smartextract": ("Smart extract (AI-powered scraping)", _smart)}
+    conn = get_connection()
+    for name in _discovery_sources():
+        label, fn = runners[name]
+        console.print(f"  [cyan]{label}...[/cyan]")
+        started = datetime.now(UTC).isoformat()
+        before = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        status, error = "ok", None
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- source isolation
+            status, error = "error", f"{type(e).__name__}: {e}"
+            log.error("%s failed: %s", label, e)
+            console.print(f"  [red]{label} error:[/red] {e}")
+        new = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] - before
+        seen = conn.execute("SELECT COUNT(*) FROM jobs WHERE last_seen_at >= ?", (started,)).fetchone()[0]
+        log_discovery_run(conn, run_id=run_id, source=name, started_at=started, status=status,
+                          new_count=new, seen_count=seen, error=error)
+        stats[name] = "ok" if status == "ok" else f"error: {error}"
     return stats
+
+
+def _run_verify() -> dict:
+    """Stage: posting verification (applypilot.verify)."""
+    from applypilot.verify import run_verification
+    return run_verification()
+
+
+def _run_dedupe() -> dict:
+    """Stage: cross-source duplicate detection (applypilot.dedupe)."""
+    from applypilot.dedupe import run_dedupe
+    return run_dedupe()
+
+
+def _run_classify() -> dict:
+    """Stage: deterministic geographic eligibility before any LLM call."""
+    from applypilot.eligibility import classify_jobs
+    counts = classify_jobs(get_connection())
+    return {"status": "ok", **{str(k): v for k, v in (counts or {}).items()}}
+
+
+def _run_prepare() -> dict:
+    """Stage: readiness evaluation and review queue (applypilot.readiness)."""
+    from applypilot.readiness import run_prepare
+    return run_prepare()
 
 
 def _run_enrich(workers: int = 1) -> dict:
@@ -159,10 +210,14 @@ def _run_pdf() -> dict:
 _STAGE_RUNNERS: dict[str, callable] = {
     "discover": _run_discover,
     "enrich":   _run_enrich,
+    "verify":   _run_verify,
+    "dedupe":   _run_dedupe,
+    "classify": _run_classify,
     "score":    _run_score,
     "tailor":   _run_tailor,
     "cover":    _run_cover,
     "pdf":      _run_pdf,
+    "prepare":  _run_prepare,
 }
 
 
@@ -223,26 +278,37 @@ class _StageTracker:
 # SQL to count pending work for each stage
 _PENDING_SQL: dict[str, str] = {
     "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
+    # Must match database.get_jobs_by_stage, or streaming mode would poll work it never processes.
     "score":  ("SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL "
-               f"AND {SQL_NOT_INELIGIBLE}"),
+               f"AND {SQL_NOT_INELIGIBLE} AND duplicate_of IS NULL AND COALESCE(score_attempts, 0) < 5 "
+               "AND (posting_status IS NULL OR posting_status NOT IN ('closed', 'removed'))"),
     "tailor": (
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
         "AND full_description IS NOT NULL "
         "AND tailored_resume_path IS NULL "
-        f"AND COALESCE(tailor_attempts, 0) < 5 AND {SQL_ELIGIBLE}"
+        f"AND COALESCE(tailor_attempts, 0) < 5 AND {SQL_ELIGIBLE} "
+        "AND posting_status = 'active' AND duplicate_of IS NULL "
+        "AND COALESCE(resume_validation, '') != 'needs_review'"
     ),
     "cover": (
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        "AND COALESCE(resume_validation, 'passed') = 'passed' AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
+        "AND COALESCE(cover_validation, '') != 'needs_review' "
         "AND COALESCE(cover_attempts, 0) < 5"
     ),
+
     "pdf": (
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
         "AND tailored_resume_path LIKE '%.txt'"
     ),
 }
 
+# Stages that process the whole table in one pass (no pending-work polling).
+_RUN_ONCE = ("verify", "dedupe", "classify", "prepare")
+
 # How long to sleep between polling loops in streaming mode (seconds)
+
 _STREAM_POLL_INTERVAL = 10
 
 
@@ -280,6 +346,17 @@ def _run_stage_streaming(
         kwargs["workers"] = workers
 
     upstream = _UPSTREAM[stage]
+
+    if stage in _RUN_ONCE:
+        # Batch stages over the whole table: run once, after their upstream has finished.
+        while upstream and not tracker.is_done(upstream) and not stop_event.is_set():
+            tracker.wait(upstream, timeout=_STREAM_POLL_INTERVAL)
+        try:
+            tracker.mark_done(stage, runner(**kwargs))
+        except Exception as e:
+            log.exception("Stage '%s' crashed", stage)
+            tracker.mark_done(stage, {"status": f"error: {e}"})
+        return
 
     if stage == "discover":
         # Discover runs once (its sub-scrapers already do their full crawl)

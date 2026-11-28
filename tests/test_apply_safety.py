@@ -39,17 +39,18 @@ class ApplySafetyTestCase(unittest.TestCase):
 
     def add_job(self, url, score=8, app_url=None, status=None, attempts=None,
                 applied_at=None, agent_id=None, last_attempted_at=None,
-                elig="eligible_nc", elig_version=eligibility.CLASSIFIER_VERSION, tier="high"):
+                elig="eligible_nc", elig_version=eligibility.CLASSIFIER_VERSION, tier="high",
+                readiness="ready", review="approved"):
         self.conn.execute(
             """INSERT INTO jobs (url, title, site, application_url, tailored_resume_path,
                                  fit_score, apply_status, apply_attempts, applied_at,
                                  agent_id, last_attempted_at, discovered_at,
                                  eligibility_status, eligibility_version, eligibility_tier,
-                                 eligibility_reason)
+                                 eligibility_reason, readiness, review_status)
                VALUES (?, 'IT Support Specialist', 'Acme', ?, '/tmp/resume.pdf', ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, 'test')""",
+                       ?, ?, ?, 'test', ?, ?)""",
             (url, app_url or url, score, status, attempts, applied_at, agent_id,
-             last_attempted_at, APPLIED_AT, elig, elig_version, tier),
+             last_attempted_at, APPLIED_AT, elig, elig_version, tier, readiness, review),
         )
         self.conn.commit()
 
@@ -289,6 +290,16 @@ class AcquisitionTests(ApplySafetyTestCase):
         self.add_job(f"{ATS}/1", score=7)
         self.assertEqual(launcher.acquire_job(target_url=f"{ATS}/1")["url"], f"{ATS}/1")
 
+    def test_not_ready_or_unapproved_jobs_are_never_claimed(self):
+        self.add_job(f"{ATS}/blocked", readiness="blocked")
+        self.add_job(f"{ATS}/unreviewed", review=None)
+        self.assertIsNone(launcher.acquire_job(target_url=f"{ATS}/blocked", dry_run=True))
+        self.assertIsNone(launcher.acquire_job(target_url=f"{ATS}/unreviewed"))   # real run needs approval
+        job = launcher.acquire_job(target_url=f"{ATS}/unreviewed", dry_run=True)  # dry run: ready suffices
+        self.assertEqual(job["url"], f"{ATS}/unreviewed")
+        self.assertIsNone(launcher.acquire_job())
+
+
     def test_target_url_rejects_applied_in_progress_and_review(self):
         self.add_job(f"{ATS}/1", status="applied", applied_at=APPLIED_AT)
         self.add_job(f"{ATS}/2", status="in_progress")
@@ -382,6 +393,11 @@ class EligibilityGateTests(ApplySafetyTestCase):
         pending_score = {j["url"] for j in database.get_jobs_by_stage(self.conn, "pending_score", limit=0)}
         self.assertEqual(pending_score, {f"{ATS}/e", f"{ATS}/u"}, "ineligible jobs never reach the LLM")
         self.conn.execute("UPDATE jobs SET fit_score = 9")
+        self.conn.commit()
+        pending_tailor = {j["url"] for j in database.get_jobs_by_stage(self.conn, "pending_tailor",
+                                                                      min_score=7, limit=0)}
+        self.assertEqual(pending_tailor, set(), "documents only for verified-active postings")
+        self.conn.execute("UPDATE jobs SET posting_status = 'active'")
         self.conn.commit()
         pending_tailor = {j["url"] for j in database.get_jobs_by_stage(self.conn, "pending_tailor",
                                                                       min_score=7, limit=0)}

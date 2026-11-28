@@ -11,7 +11,6 @@ to avoid apologetic spirals.
 
 import json
 import logging
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -344,9 +343,13 @@ def judge_tailored_resume(
 
 # ── Core Tailoring ───────────────────────────────────────────────────────
 
+APPROVED_STATUSES = frozenset({"approved"})  # the ONLY statuses that produce an application-ready resume
+
+
 def tailor_resume(
     resume_text: str, job: dict, profile: dict,
     max_retries: int = 3, validation_mode: str = "normal",
+    sources=None, evidence_text: str = "",
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
 
@@ -368,7 +371,16 @@ def tailor_resume(
 
     Returns:
         (tailored_text, report) where report contains validation details.
+
+    Fail closed (fork): only ``status == "approved"`` is usable. A judge rejection on the last
+    attempt is ``rejected_by_judge`` (formerly accepted as "approved_with_judge_warning"), a
+    grounding failure is ``rejected_unsupported_claims``, and an ATS-format failure is
+    ``rejected_format``. The deterministic grounding check (scoring.factcheck) runs in every
+    mode, including lenient -- only the LLM judge is optional.
     """
+    from applypilot.scoring.factcheck import ats_problems, build_sources, check_claims
+    if sources is None:
+        sources = build_sources(resume_text, profile, {})
     job_text = (
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
@@ -397,7 +409,11 @@ def tailor_resume(
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
+            {"role": "user", "content": (
+                f"ORIGINAL RESUME:\n{resume_text}\n\n"
+                + (f"USER-VERIFIED EVIDENCE (facts you may use; personal projects are NOT employment, "
+                   f"certifications marked in progress are NOT earned):\n{evidence_text}\n\n" if evidence_text else "")
+                + f"---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:")},
         ]
 
         raw = client.chat(messages, max_tokens=2048, temperature=0.4)
@@ -418,13 +434,24 @@ def tailor_resume(
             avoid_notes.extend(validation["errors"])
             if attempt < max_retries:
                 continue
-            # Last attempt — assemble whatever we got
+            # Last attempt -- kept only as a rejected artifact
             tailored = assemble_resume_text(data, profile)
             report["status"] = "failed_validation"
             return tailored, report
 
         # Assemble text (header injected by code, em dashes auto-fixed)
         tailored = assemble_resume_text(data, profile)
+
+        # Layer 1b: deterministic grounding + ATS format (never skipped)
+        unsupported = check_claims(tailored, sources, kind="resume")
+        fmt = ats_problems(tailored)
+        report["factcheck"] = {"unsupported": unsupported, "format": fmt}
+        if unsupported or fmt:
+            avoid_notes.extend([f"Remove unsupported claim: {u}" for u in unsupported[:6]] + fmt[:3])
+            if attempt < max_retries:
+                continue
+            report["status"] = "rejected_unsupported_claims" if unsupported else "rejected_format"
+            return tailored, report
 
         # Layer 2: LLM judge (catches subtle fabrication) — skipped in lenient mode
         if validation_mode == "lenient":
@@ -441,8 +468,8 @@ def tailor_resume(
                 # In normal mode, only retry on judge failure if there are retries left
                 if validation_mode != "lenient":
                     continue
-            # Accept best attempt on last retry (all modes) or if lenient
-            report["status"] = "approved_with_judge_warning"
+            # Never accepted: a judge-rejected resume is stored as rejected and needs a human.
+            report["status"] = "rejected_by_judge"
             return tailored, report
 
         # Both passed
@@ -453,7 +480,22 @@ def tailor_resume(
     return tailored, report
 
 
+def _rejection_reasons(report: dict) -> list[str]:
+    if report.get("status") in APPROVED_STATUSES:
+        return []
+    out = [report.get("status", "rejected")]
+    fc = report.get("factcheck") or {}
+    out += list(fc.get("unsupported") or [])[:10] + list(fc.get("format") or [])[:5]
+    val = report.get("validator") or {}
+    out += list(val.get("errors") or [])[:5]
+    judge = report.get("judge") or {}
+    if judge and not judge.get("passed", True):
+        out.append(f"judge: {str(judge.get('issues'))[:300]}")
+    return out
+
+
 # ── Batch Entry Point ────────────────────────────────────────────────────
+
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
                   validation_mode: str = "normal") -> dict:
@@ -470,6 +512,15 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+    from applypilot.scoring import documents as D
+    from applypilot.scoring.candidate_evidence import format_candidate_evidence
+    sources = D.truth_sources(profile, resume_text)
+    evidence = D.load_evidence_safe()
+    evidence_text = format_candidate_evidence(evidence) if evidence else ""
+    try:
+        model = get_client().model
+    except Exception:  # noqa: BLE001
+        model = "unknown"
 
     # Only verified-eligible jobs are tailored; classify any not yet evaluated by the current version.
     from applypilot.eligibility import classify_jobs
@@ -491,19 +542,17 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         completed += 1
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
-                                             validation_mode=validation_mode)
+                                             validation_mode=validation_mode,
+                                             sources=sources, evidence_text=evidence_text)
+            report["model"] = model
+            approved = report["status"] in APPROVED_STATUSES
+            prefix = D.safe_prefix(job)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
-
-            # Save tailored resume text
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
+            # Approved resumes go to TAILORED_DIR; rejected attempts to TAILORED_DIR/rejected
+            txt_path = D.save_artifact(TAILORED_DIR, prefix, "", tailored, report, approved)
 
             # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+            job_path = txt_path.parent / f"{prefix}_JOB.txt"
             job_desc = (
                 f"Title: {job['title']}\n"
                 f"Company: {job['site']}\n"
@@ -514,14 +563,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             )
             job_path.write_text(job_desc, encoding="utf-8")
 
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-            # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
+            # PDF only for approved resumes (best-effort)
             pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            if approved:
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
                     pdf_path = str(convert_to_pdf(txt_path))
@@ -536,6 +580,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "site": job["site"],
                 "status": report["status"],
                 "attempts": report["attempts"],
+                "reasons": _rejection_reasons(report),
+                "fingerprint": D.fingerprint(job, profile, resume_text),
             }
         except Exception as e:
             result = {
@@ -558,36 +604,37 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             result["title"][:40],
         )
 
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
+    # Persist: the path is saved ONLY for approved resumes; rejected ones keep their own path/reasons.
     now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:
-        if r["status"] in _success_statuses:
+        if r["status"] in APPROVED_STATUSES:
             conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, resume_validation='passed', "
+                "resume_validation_reasons=NULL, resume_model=?, documents_for=?, "
                 "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
+                (r["path"], now, model, r.get("fingerprint"), r["url"]),
             )
+        elif r["status"] == "error":
+            conn.execute("UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?", (r["url"],))
         else:
+            # Judge rejections need a human; other rejections may be retried up to MAX_ATTEMPTS.
+            state = "needs_review" if r["status"] == "rejected_by_judge" else "rejected"
             conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
+                "UPDATE jobs SET resume_validation=?, resume_validation_reasons=?, resume_rejected_path=?, "
+                "resume_model=?, tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (state, json.dumps(r.get("reasons") or [r["status"]]), r["path"], model, r["url"]),
             )
     conn.commit()
 
     elapsed = time.time() - t0
-    log.info(
-        "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, %d errors",
-        elapsed,
-        stats.get("approved", 0),
-        stats.get("failed_validation", 0),
-        stats.get("failed_judge", 0),
-        stats.get("error", 0),
-    )
+    rejected = sum(v for k, v in stats.items() if k not in ("approved", "error"))
+    log.info("Tailoring done in %.1fs: %d approved, %d rejected %s, %d errors", elapsed,
+             stats.get("approved", 0), rejected,
+             {k: v for k, v in stats.items() if k not in ("approved", "error") and v}, stats.get("error", 0))
 
     return {
         "approved": stats.get("approved", 0),
-        "failed": stats.get("failed_validation", 0) + stats.get("failed_judge", 0),
+        "failed": rejected,
         "errors": stats.get("error", 0),
         "elapsed": elapsed,
     }

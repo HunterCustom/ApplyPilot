@@ -21,7 +21,8 @@ import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, record_sighting
+from applypilot.dates import iso_date
 
 log = logging.getLogger(__name__)
 
@@ -263,6 +264,7 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
         job["apply_url"] = info.get("externalUrl", "")
         job["job_req_id"] = info.get("jobReqId", "")
         job["time_type"] = info.get("timeType", "")
+        job["date_posted"] = iso_date(info.get("startDate"))  # exact posting date only, never "N days ago"
         job["remote_type"] = info.get("remoteType", "")
 
     except Exception as e:
@@ -335,6 +337,11 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+        record_sighting(conn, url, site, company=job.get("employer_name"), date_posted=job.get("date_posted"),
+                        job_type=job.get("time_type"), now=now)
+        if job.get("job_req_id"):
+            conn.execute("UPDATE jobs SET requisition_id = COALESCE(requisition_id, ?) WHERE url = ?",
+                         (str(job["job_req_id"])[:80], url))
 
     conn.commit()
     return new, existing

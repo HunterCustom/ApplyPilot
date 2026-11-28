@@ -77,6 +77,20 @@ def _parse_score_response(response: str) -> dict:
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
+SCORE_PROMPT_VERSION = "2"  # bump when SCORE_PROMPT or the parse rules change (recorded per score)
+SCORE_TEMPERATURE = 0.2
+
+
+def score_config(evidence_text: str) -> dict:
+    """What produced a score: recorded with it for traceability (model is recorded separately)."""
+    import hashlib
+    return {"prompt_version": SCORE_PROMPT_VERSION,
+            "prompt_sha": hashlib.sha256(SCORE_PROMPT.encode()).hexdigest()[:12],
+            "temperature": SCORE_TEMPERATURE,
+            "max_tokens": max(256, int(os.environ.get("APPLYPILOT_SCORE_MAX_TOKENS", "2048"))),
+            "evidence": bool(evidence_text)}
+
+
 def score_job(resume_text: str, job: dict, evidence_text: str = "") -> dict:
     """Score one job, retrying empty, malformed and failed LLM responses.
 
@@ -101,7 +115,7 @@ def score_job(resume_text: str, job: dict, evidence_text: str = "") -> dict:
 
     for attempt in range(1, max_attempts + 1):
         try:
-            response = get_client().chat(messages, max_tokens=max_tokens, temperature=0.2)
+            response = get_client().chat(messages, max_tokens=max_tokens, temperature=SCORE_TEMPERATURE)
             if not response or not response.strip():
                 raise ValueError("Empty LLM response")
             if not re.search(r"(?im)^\s*SCORE:\s*(?:10|[1-9])\s*$", response):
@@ -167,19 +181,37 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     scored = 0
     errors = 0
 
+    try:
+        model = get_client().model
+    except Exception:  # noqa: BLE001 -- recorded as unknown, scoring itself reports LLM errors
+        model = "unknown"
+    cfg_json = json.dumps(score_config(evidence_text), sort_keys=True)
     for index, job in enumerate(jobs, start=1):
         result = score_job(resume_text, job, evidence_text)
         if result["score"] == 0:
             errors += 1
+            # Not a score: the error and attempt count are kept so the job is retried (resumable)
+            # up to the pending_score attempt cap, and the failure is visible in reports.
+            conn.execute("UPDATE jobs SET score_error = ?, score_attempts = COALESCE(score_attempts, 0) + 1"
+                         " WHERE url = ?", (result["reasoning"][:300], job["url"]))
+            conn.commit()
             log.warning("[%d/%d] not saved (retryable): %s", index, len(jobs), job.get("title", "?"))
             continue
 
         now = datetime.now(timezone.utc).isoformat()
+        if job.get("fit_score") is not None:
+            # Rescoring never loses history.
+            conn.execute("INSERT INTO score_history (url, fit_score, score_reasoning, scored_at, score_model,"
+                         " score_config, replaced_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (job["url"], job.get("fit_score"), job.get("score_reasoning"), job.get("scored_at"),
+                          job.get("score_model"), job.get("score_config"), now))
         conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, job["url"]),
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, score_model = ?, score_config = ?,"
+            " score_error = NULL, score_attempts = COALESCE(score_attempts, 0) + 1 WHERE url = ?",
+            (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, model, cfg_json, job["url"]),
         )
         conn.commit()
+
         scored += 1
         log.info("[%d/%d] score=%d saved: %s", index, len(jobs), result["score"], job.get("title", "?")[:60])
 

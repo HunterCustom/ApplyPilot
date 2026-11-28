@@ -73,21 +73,10 @@ def _build_profile_summary(profile: dict) -> str:
     # Availability
     lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
 
-    # Standard responses
-    lines.extend([
-        "Age 18+: Yes",
-        "Background Check: Yes",
-        "Felony: No",
-        "Previously Worked Here: No",
-        "How Heard: Online Job Board",
-    ])
-
-    # EEO
-    lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
-    lines.append(f"Race: {eeo.get('race_ethnicity', 'Decline to self-identify')}")
-    lines.append(f"Veteran: {eeo.get('veteran_status', 'I am not a protected veteran')}")
-    lines.append(f"Disability: {eeo.get('disability_status', 'I do not wish to answer')}")
-
+    # Fork: no hard-coded answers to consequential questions (age, background check, criminal
+    # history, prior employment) and no EEO values here. Those come only from the candidate's
+    # verified screening_answers.yaml (see applypilot.screening) or a human.
+    del eeo
     return "\n".join(lines)
 
 
@@ -130,68 +119,20 @@ Check EARLY, before filling any form."""
 
 
 def _build_salary_section(profile: dict) -> str:
-    """Build the salary negotiation instructions.
-
-    Adapts floor, range, and currency from the profile's compensation section.
-    """
-    comp = profile["compensation"]
-    currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
-    range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
-    conversion_note = comp.get("currency_conversion_note", "")
-
-    # Compute example hourly rates at 3 salary levels
-    try:
-        floor_int = int(floor)
-        examples = [
-            (f"${floor_int // 1000}K", floor_int // 2080),
-            (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
-            (f"${(floor_int + 55000) // 1000}K", (floor_int + 55000) // 2080),
-        ]
-        hourly_line = ", ".join(f"{sal} = ${hr}/hr" for sal, hr in examples)
-    except (ValueError, TypeError):
-        hourly_line = "Divide annual salary by 2080"
-
-    # Currency conversion guidance
-    if conversion_note:
-        convert_line = f"Posting is in a different currency? -> {conversion_note}"
-    else:
-        convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
-
-    return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
-
-Decision tree:
-1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
-2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
-3. {convert_line}
-4. No salary info anywhere? -> Use ${floor} {currency}.
-5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "${range_min}-${range_max} {currency}".
-6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
+    """Salary guidance (fork): no negotiation heuristics -- a figure only from verified answers."""
+    del profile
+    return ("== SALARY ==\nGive a salary figure ONLY if the screening answers below contain one; otherwise "
+            "leave optional salary fields blank, and for a required one output RESULT:FAILED:needs_human_answer.")
 
 
 def _build_screening_section(profile: dict) -> str:
-    """Build the screening questions guidance section."""
-    personal = profile["personal"]
-    exp = profile.get("experience", {})
-    city = personal.get("city", "their city")
-    years = exp.get("years_of_experience_total", "multiple")
-    target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
-    work_auth = profile["work_authorization"]
-
-    return f"""== SCREENING QUESTIONS (be strategic) ==
-Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
-  - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
-  - Citizenship, clearance, licenses, certifications: answer from profile only
-  - Criminal/background: answer from profile only
-
-Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
-
-Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
-
-EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+    """Screening guidance: verified reusable answers only, everything else stops for a human (fork)."""
+    from applypilot import screening
+    try:
+        return screening.agent_section()
+    except ValueError as e:
+        return ("== SCREENING QUESTIONS ==\nThe candidate's answer file is invalid "
+                f"({str(e)[:80]}); answer no screening question: output RESULT:FAILED:needs_human_answer.")
 
 
 def _build_hard_rules(profile: dict) -> str:

@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import get_connection, init_db, record_sighting, store_jobs
+from applypilot.dates import iso_date
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +178,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+        job_type = str(row.get("job_type", "")) if str(row.get("job_type", "")) not in ("", "nan", "None") else None
+        record_sighting(conn, url, site_label, company=company, date_posted=iso_date(row.get("date_posted")),
+                        job_type=job_type, now=now, source_url=url)
 
     conn.commit()
     return new, existing

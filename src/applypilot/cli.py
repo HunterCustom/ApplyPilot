@@ -26,7 +26,8 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
-VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+VALID_STAGES = ("discover", "enrich", "verify", "dedupe", "classify", "score", "tailor", "cover", "pdf",
+                "prepare")
 
 
 # ---------------------------------------------------------------------------
@@ -568,5 +569,12 @@ def doctor() -> None:
     console.print()
 
 
+# Fork: operational commands (verify, dedupe, review, screening, report, daily).
+from applypilot import cli_ops as _cli_ops  # noqa: E402
+
+_cli_ops.register(app)
+
+
 if __name__ == "__main__":
     app()
+
