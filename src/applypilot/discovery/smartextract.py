@@ -77,13 +77,36 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 # -- Site configuration from YAML --------------------------------------------
 
 def load_sites() -> list[dict]:
-    """Load scraping target sites from config/sites.yaml."""
-    path = CONFIG_DIR / "sites.yaml"
-    if not path.exists():
-        log.warning("sites.yaml not found at %s", path)
-        return []
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data.get("sites", [])
+    """Scraping targets: packaged ``config/sites.yaml`` plus ``APP_DIR/sites.yaml`` (fork).
+
+    The user file may add ``sites:`` entries (``name`` + https ``url`` with the usual
+    ``{query_encoded}`` / ``{location_encoded}`` placeholders) and set ``use_packaged: false``
+    to skip the packaged list. Packaged block lists and manual-ATS rules always apply."""
+    from applypilot.config import APP_DIR
+    out: list[dict] = []
+    use_packaged = True
+    user_path = APP_DIR / "sites.yaml"
+    user_sites: list[dict] = []
+    if user_path.exists():
+        try:
+            udata = yaml.safe_load(user_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as e:
+            log.error("APP_DIR sites.yaml is not valid YAML (%s); ignoring it", e)
+            udata = {}
+        use_packaged = udata.get("use_packaged", True) is not False
+        for s in udata.get("sites") or []:
+            if isinstance(s, dict) and s.get("name") and str(s.get("url", "")).startswith("https://"):
+                user_sites.append(dict(s))
+            else:
+                log.warning("APP_DIR sites.yaml: entry ignored (needs name and an https url): %r", s)
+    if use_packaged:
+        path = CONFIG_DIR / "sites.yaml"
+        if path.exists():
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            out.extend(data.get("sites", []) or [])
+        else:
+            log.warning("sites.yaml not found at %s", path)
+    return out + user_sites
 
 
 def _store_jobs_filtered(

@@ -110,8 +110,13 @@ def register(app: typer.Typer) -> None:
             raise typer.Exit(code=1)
         job = dict(row)
         ok, reasons, info = readiness.evaluate(job, conn)
+        from applypilot import ranking
+        _pts, pref_note = ranking.preference_points(job, ranking.load_preferences())
         console.rule(f"{_e(job.get('title'))} @ {_e(job.get('company') or job.get('site'))}")
         for k, v in (("Location", job.get("location")), ("Salary", job.get("salary") or "not stated"),
+                     ("Preference", pref_note),
+                     ("Final posting URL", job.get("posting_final_url") or "-"),
+                     ("Resume hash", f"{(job.get('resume_sha') or '-')[:16]} / PDF {(job.get('resume_pdf_sha') or '-')[:16]}"),
                      ("Official posting", job.get("posting_verified_url") or job.get("application_url") or url),
                      ("Posting", (f"{job.get('posting_status')} - {job.get('posting_reason')} "
                                   f"(checked {job.get('posting_checked_at')})")),
@@ -209,6 +214,47 @@ def register(app: typer.Typer) -> None:
         for r in rows:
             t.add_row(*[_e(r.get(c))[:300] for c in cols])
         console.print(t)
+
+    @app.command("employers")
+    def employers_cmd(
+        verify: bool = typer.Option(False, "--verify", help="Probe each APP_DIR employers.yaml entry with one "
+                                                            "read-only Workday job search and record the result."),
+    ) -> None:
+        """Your Workday employer watchlist (APP_DIR/employers.yaml): entries and verification status."""
+        from applypilot.discovery import workday
+        user, use_packaged = workday.load_user_employers()
+        if not user:
+            console.print("No entries in APP_DIR/employers.yaml (see DEPLOYMENT.md, 'Employer watchlist').")
+            return
+        results = workday.verify_user_employers() if verify else workday.verified_identities()
+        for key, e in user.items():
+            rec = results.get(key) or {}
+            current = rec.get("identity") == workday._employer_identity(e)
+            state = ("[green]verified[/green]" if rec.get("ok") and current else
+                     "[yellow]not verified[/yellow]" if not rec else
+                     f"[red]failed[/red] ({_e(rec.get('reason'))})" if current else "[yellow]changed since check[/yellow]")
+            console.print(f"{_e(key)}: {_e(e.get('name') or key)} -- {_e(e['base_url'])} -- {state}")
+        console.print(f"Packaged registry also crawled: {'yes' if use_packaged else 'no'}")
+
+    @app.command("rescore")
+    def rescore_cmd(
+        limit: int = typer.Option(100, "--limit", help="Maximum jobs to rescore in this run."),
+    ) -> None:
+        """Rescore jobs whose score came from another model/prompt/evidence/resume (old scores kept)."""
+        from applypilot.config import APP_DIR
+        from applypilot.daily import EXIT_LOCKED, LOCK_NAME, RunLock
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        lock = RunLock(APP_DIR / LOCK_NAME)
+        if not lock.acquire():
+            console.print("[red]Another ApplyPilot run is in progress; exiting.[/red]")
+            raise typer.Exit(code=EXIT_LOCKED)
+        try:
+            _bootstrap()
+            from applypilot.scoring.scorer import run_scoring
+            out = run_scoring(limit=limit, rescore=True)
+            console.print({k: v for k, v in out.items() if k != "distribution"})
+        finally:
+            lock.release()
 
     @app.command("isolation")
     def isolation_cmd(

@@ -241,9 +241,12 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_validation, '') != 'needs_review' "
         "AND COALESCE(cover_attempts, 0) < ? "
-        "ORDER BY fit_score DESC LIMIT ?",
-        (min_score, MAX_ATTEMPTS, limit),
+        "ORDER BY fit_score DESC",
+        (min_score, MAX_ATTEMPTS),
     ).fetchall()
+    from applypilot.ranking import rank
+    jobs = rank([dict(r) for r in jobs])
+    jobs = jobs[:limit] if limit else jobs
 
     if not jobs:
         log.info("No jobs needing cover letters (score >= %d).", min_score)

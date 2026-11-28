@@ -29,14 +29,106 @@ log = logging.getLogger(__name__)
 
 # -- Employer registry from YAML --------------------------------------------
 
-def load_employers() -> dict:
-    """Load Workday employer registry from config/employers.yaml."""
-    path = CONFIG_DIR / "employers.yaml"
+_WORKDAY_BASE_RE = re.compile(r"^https://[a-z0-9-]+\.wd\d{1,3}\.myworkdayjobs\.com$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+USER_EMPLOYERS = "employers.yaml"            # APP_DIR watchlist (fork)
+VERIFIED_EMPLOYERS = "employers.verified.json"  # written by `applypilot employers --verify`
+
+
+def _valid_employer(e) -> bool:
+    return (isinstance(e, dict) and bool(_WORKDAY_BASE_RE.match(str(e.get("base_url", ""))))
+            and bool(_SAFE_ID_RE.match(str(e.get("tenant", "")))) and bool(_SAFE_ID_RE.match(str(e.get("site_id", "")))))
+
+
+def _employer_identity(e: dict) -> str:
+    return f"{e.get('base_url')}|{e.get('tenant')}|{e.get('site_id')}"
+
+
+def load_user_employers() -> tuple[dict, bool]:
+    """(entries, use_packaged) from ``APP_DIR/employers.yaml`` (fork)::
+
+        use_packaged: false        # default true: also crawl the packaged registry
+        employers:
+          duke:
+            name: "Duke University"
+            tenant: "<tenant>"     # from the employer's real Workday careers URL
+            site_id: "<site>"
+            base_url: "https://<tenant>.wd1.myworkdayjobs.com"
+    """
+    from applypilot.config import APP_DIR
+    path = APP_DIR / USER_EMPLOYERS
     if not path.exists():
-        log.warning("employers.yaml not found at %s", path)
+        return {}, True
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        log.error("%s is not valid YAML (%s); ignoring it", USER_EMPLOYERS, e)
+        return {}, True
+    entries = data.get("employers") or {}
+    good = {}
+    for key, e in entries.items() if isinstance(entries, dict) else []:
+        if _valid_employer(e):
+            good[str(key)] = dict(e)
+        else:
+            log.warning("employers.yaml: '%s' ignored (needs https://<tenant>.wdN.myworkdayjobs.com, tenant, site_id)",
+                        key)
+    return good, data.get("use_packaged", True) is not False
+
+
+def verified_identities() -> dict:
+    from applypilot.config import APP_DIR
+    try:
+        return json.loads((APP_DIR / VERIFIED_EMPLOYERS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data.get("employers", {})
+
+
+def load_employers() -> dict:
+    """Workday registry: packaged ``config/employers.yaml`` plus the user's ``APP_DIR/employers.yaml``.
+
+    User entries are crawled only after ``applypilot employers --verify`` confirmed that exact
+    endpoint (base URL, tenant and site id) answers as a Workday job search; unverified or
+    malformed entries are skipped with a warning, never guessed or corrected."""
+    out: dict = {}
+    user, use_packaged = load_user_employers()
+    if use_packaged:
+        path = CONFIG_DIR / "employers.yaml"
+        if path.exists():
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            out.update(data.get("employers", {}) or {})
+        else:
+            log.warning("employers.yaml not found at %s", path)
+    verified = verified_identities()
+    for key, e in user.items():
+        rec = verified.get(key)
+        if isinstance(rec, dict) and rec.get("identity") == _employer_identity(e) and rec.get("ok"):
+            out[key] = e
+        else:
+            log.warning("employers.yaml: '%s' not verified yet; run `applypilot employers --verify`", key)
+    return out
+
+
+def verify_user_employers(search=None) -> dict:
+    """Probe each user employer with one read-only job search (limit 1) and record the result."""
+    from applypilot.config import APP_DIR
+    search = search or workday_search
+    user, _ = load_user_employers()
+    results: dict = {}
+    for key, e in user.items():
+        try:
+            data = search(e, "", limit=1)
+            total = data.get("total") if isinstance(data, dict) else None
+            ok = isinstance(data, dict) and isinstance(data.get("jobPostings"), list)
+            results[key] = {"identity": _employer_identity(e), "ok": ok, "total": total,
+                            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "reason": "Workday job search answered" if ok else "unexpected response"}
+        except Exception as ex:  # noqa: BLE001 -- recorded per employer
+            results[key] = {"identity": _employer_identity(e), "ok": False,
+                            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "reason": f"{type(ex).__name__}: {str(ex)[:120]}"}
+    (APP_DIR / VERIFIED_EMPLOYERS).write_text(json.dumps(results, indent=2), encoding="utf-8")
+    return results
+
 
 
 # -- Location filtering from search config -----------------------------------

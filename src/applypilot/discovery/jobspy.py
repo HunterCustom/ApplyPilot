@@ -77,6 +77,32 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
 
 # -- Location filtering ------------------------------------------------------
 
+# Boards python-jobspy supports. A configured board is used only if it is in this list and not
+# blocked by the packaged site rules (config/sites.yaml "blocked") -- e.g. Glassdoor (fork).
+SUPPORTED_BOARDS = ("indeed", "linkedin", "zip_recruiter", "glassdoor", "google")
+
+
+def permitted_sites(sites: list[str] | None) -> list[str] | None:
+    """Configured boards minus unsupported and blocked ones (None keeps the upstream default)."""
+    if sites is None:
+        return None
+    from applypilot.config import load_blocked_sites
+    try:
+        blocked = {s.lower() for s in load_blocked_sites()[0]}
+    except Exception:  # noqa: BLE001 -- unreadable rules: block nothing extra, keep the allowlist
+        blocked = set()
+    out = []
+    for s in sites:
+        name = str(s).strip().lower()
+        if name not in SUPPORTED_BOARDS:
+            log.warning("Job board %r is not supported; skipped", s)
+        elif name in blocked:
+            log.warning("Job board %r is blocked by ApplyPilot site rules; skipped", s)
+        else:
+            out.append(name)
+    return out
+
+
 def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
     """Extract accept/reject location lists from search config.
 
@@ -465,7 +491,7 @@ def run_discovery(cfg: dict | None = None) -> dict:
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
+    sites = permitted_sites(cfg.get("sites"))
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")

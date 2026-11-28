@@ -159,13 +159,24 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         log.info("Eligibility classified %d jobs: %s", sum(classified.values()), classified)
 
     if rescore:
-        # Same filters as ordinary selection (audit R11), except that scored rows are included;
-        # the previous score is preserved in score_history before it is replaced.
+        # Same filters as ordinary selection (audit R11), except that scored rows are included --
+        # but only scores not made by the current model + prompt + evidence + resume, so repeated
+        # bounded runs make progress. The previous score is preserved in score_history.
+        try:
+            current_model = get_client().model
+        except Exception:  # noqa: BLE001
+            current_model = "unknown"
+        current_cfg = json.dumps(score_config(evidence_text, resume_text), sort_keys=True)
         query = (f"SELECT * FROM jobs WHERE full_description IS NOT NULL AND {SQL_NOT_INELIGIBLE}"
-                 " AND duplicate_of IS NULL AND (posting_status IS NULL OR posting_status NOT IN ('closed', 'removed'))")
+                 " AND duplicate_of IS NULL AND (posting_status IS NULL OR posting_status NOT IN ('closed', 'removed'))"
+                 " AND COALESCE(score_attempts, 0) < 5"
+                 " AND (fit_score IS NULL OR score_config IS NULL OR score_config != ? OR score_model IS NULL"
+                 " OR score_model != ?) ORDER BY fit_score DESC NULLS LAST")
+        params: list = [current_cfg, current_model]
         if limit > 0:
-            query += f" LIMIT {int(limit)}"
-        jobs = conn.execute(query).fetchall()
+            query += " LIMIT ?"
+            params.append(int(limit))
+        jobs = conn.execute(query, params).fetchall()
     else:
         # Load all candidates before limiting, so ranking applies globally.
         # Without a user priority.yaml, preserve the original database ordering.

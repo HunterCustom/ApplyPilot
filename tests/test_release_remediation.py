@@ -30,6 +30,7 @@ from applypilot.scoring import cover_letter, tailor
 from applypilot.scoring import pdf as pdf_mod
 
 atexit.unregister(chrome.cleanup_on_exit)
+NOW_ISO = __import__('datetime').datetime.now(__import__('datetime').UTC).isoformat()
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1293,6 +1294,140 @@ class DedupeRemediationTests(TempEnv):
         r = self.row("https://www.indeed.com/viewjob?jk=9a1b2c")
         self.assertEqual(r["duplicate_of"], job)
         self.assertIn("application history", r["duplicate_reason"])
+
+
+
+# --- P5: preference ranking, employer registries, permitted discovery --------------------------------------
+
+from applypilot import ranking
+from applypilot.discovery import jobspy as jobspy_mod
+from applypilot.discovery import smartextract, workday
+
+
+class RankingTests(unittest.TestCase):
+    def test_salary_is_a_preference_never_a_filter(self):
+        jobs = [{"url": "low", "fit_score": 8, "salary": "$40,000 a year"},
+                {"url": "none", "fit_score": 8, "salary": None},
+                {"url": "high", "fit_score": 8, "salary": "$95,000 - $105,000 a year"}]
+        ranked = ranking.rank(jobs, ranking.DEFAULTS)
+        self.assertEqual([j["url"] for j in ranked], ["high", "none", "low"])
+        self.assertEqual(len(ranked), 3)  # nothing dropped
+
+    def test_fit_dominates_and_commute_breaks_ties(self):
+        jobs = [{"url": "far", "fit_score": 8, "eligibility_tier": "acceptable"},
+                {"url": "near", "fit_score": 8, "eligibility_tier": "highest"},
+                {"url": "better-fit", "fit_score": 10, "eligibility_tier": "acceptable", "salary": "$40,000"}]
+        self.assertEqual([j["url"] for j in ranking.rank(jobs, ranking.DEFAULTS)], ["better-fit", "near", "far"])
+
+    def test_hourly_pay_is_annualized_and_flagged(self):
+        label, _pts, note = ranking.salary_band({"salary": "$30 - $35 an hour"}, ranking.DEFAULTS)
+        self.assertEqual(label, "acceptable")  # ~$67,600 at 2080 h
+        self.assertIn("confirm hours, classification, benefits and travel pay", note)
+
+    def test_preferences_from_priority_yaml(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "priority.yaml"
+            p.write_text("salary:\n  hours_per_year: 1800\n  undisclosed: 0\ncommute:\n  highest: 50\n", encoding="utf-8")
+            prefs = ranking.load_preferences(p)
+        self.assertEqual((prefs["salary"]["hours_per_year"], prefs["salary"]["undisclosed"]), (1800, 0))
+        self.assertEqual(prefs["commute"]["highest"], 50)
+
+
+class TailorRankingTests(TailorTests):
+    def test_batch_limit_takes_the_best_ranked_jobs(self):
+        urls = []
+        for i, sal in enumerate(("$45,000 a year", "$100,000 a year")):
+            u = f"https://careers.synthbank.test/jobs/{900 + i}"
+            self.add(u, application_url=u, fit_score=8, posting_status="active", posting_checked_at=NOW_ISO,
+                     posting_verified_url=u, salary=sal, eligibility_status="eligible_manual",
+                     eligibility_version=eligibility.MANUAL_VERSION)
+            eligibility.set_manual_decision(u, True, "synthetic", conn=self.conn)
+            urls.append(u)
+        self.llm(FakeLLM())
+        tailor.run_tailoring(min_score=7, limit=1, validation_mode="strict")
+        self.assertIsNone(self.row(urls[0])["tailored_resume_path"])
+        self.assertIsNotNone(self.row(urls[1])["tailored_resume_path"])
+
+
+class EmployerRegistryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        p = mock.patch.object(config, "APP_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write(self, text):
+        (self.tmp / "employers.yaml").write_text(textwrap.dedent(text), encoding="utf-8")
+
+    def test_unverified_and_malformed_entries_are_never_crawled(self):
+        self.write("""
+            use_packaged: false
+            employers:
+              synth:
+                name: Synthetic University
+                tenant: synth
+                site_id: Careers
+                base_url: https://synth.wd1.myworkdayjobs.com
+              evil:
+                name: Not Workday
+                tenant: x
+                site_id: y
+                base_url: http://169.254.169.254
+        """)
+        self.assertEqual(workday.load_employers(), {})  # synth unverified, evil malformed
+        user, use_packaged = workday.load_user_employers()
+        self.assertEqual((sorted(user), use_packaged), (["synth"], False))
+
+    def test_verified_entry_is_crawled_until_it_changes(self):
+        self.write("""
+            use_packaged: false
+            employers:
+              synth: {name: Synthetic University, tenant: synth, site_id: Careers,
+                      base_url: "https://synth.wd1.myworkdayjobs.com"}
+        """)
+        calls = []
+
+        def fake_search(e, text, limit=20, offset=0):
+            calls.append((e["base_url"], limit))
+            return {"total": 12, "jobPostings": []}
+        res = workday.verify_user_employers(search=fake_search)
+        self.assertTrue(res["synth"]["ok"])
+        self.assertEqual(calls, [("https://synth.wd1.myworkdayjobs.com", 1)])
+        self.assertIn("synth", workday.load_employers())
+        self.write("""
+            use_packaged: false
+            employers:
+              synth: {name: Synthetic University, tenant: other, site_id: Careers,
+                      base_url: "https://synth.wd1.myworkdayjobs.com"}
+        """)
+        self.assertEqual(workday.load_employers(), {})  # the verified identity no longer matches
+
+    def test_failed_probe_is_not_crawled(self):
+        self.write("""
+            employers:
+              synth: {name: S, tenant: synth, site_id: Careers, base_url: "https://synth.wd1.myworkdayjobs.com"}
+        """)
+
+        def broken(e, text, limit=20, offset=0):
+            raise OSError("404")
+        self.assertFalse(workday.verify_user_employers(search=broken)["synth"]["ok"])
+        self.assertNotIn("synth", workday.load_employers())
+
+    def test_user_sites_are_added_and_packaged_rules_kept(self):
+        (self.tmp / "sites.yaml").write_text(textwrap.dedent("""
+            use_packaged: false
+            sites:
+              - {name: Synthetic County Careers, url: "https://jobs.synthcounty.test/search?q={query_encoded}"}
+              - {name: Plain http, url: "http://insecure.test/jobs"}
+        """), encoding="utf-8")
+        self.assertEqual([s["name"] for s in smartextract.load_sites()], ["Synthetic County Careers"])
+
+
+class PermittedBoardsTests(unittest.TestCase):
+    def test_blocked_and_unknown_boards_are_skipped(self):
+        out = jobspy_mod.permitted_sites(["indeed", "LinkedIn", "glassdoor", "zip_recruiter", "myspace"])
+        self.assertEqual(out, ["indeed", "linkedin", "zip_recruiter"])  # glassdoor is blocked by site rules
+        self.assertIsNone(jobspy_mod.permitted_sites(None))
 
 
 if __name__ == "__main__":

@@ -547,7 +547,10 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     # Only verified-eligible jobs are tailored; classify any not yet evaluated by the current version.
     from applypilot.eligibility import classify_jobs
     classify_jobs(conn)
-    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    # Order by fit plus salary/commute preferences (applypilot.ranking); never filters.
+    from applypilot.ranking import rank
+    jobs = rank(get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=0))
+    jobs = jobs[:limit] if limit else jobs
 
     if not jobs:
         log.info("No untailored jobs with score >= %d.", min_score)

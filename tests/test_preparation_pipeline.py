@@ -467,7 +467,13 @@ class ScoringTests(TempEnv):
         self.assertEqual((r["fit_score"], r["score_model"]), (8, FakeLLM.model))
         self.assertEqual(json.loads(r["score_config"])["prompt_version"], scorer.SCORE_PROMPT_VERSION)
         self.assertIsNone(r["score_error"])
+        scorer.run_scoring(rescore=True)  # current model/prompt/evidence: nothing to rescore
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM score_history").fetchone()[0], 0)
+        fake.model = "synthetic/other-14b"  # a different model: the score is stale, old one preserved
         scorer.run_scoring(rescore=True)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM score_history").fetchone()[0], 1)
+        self.assertEqual(self.row("https://x.test/1")["score_model"], "synthetic/other-14b")
+        scorer.run_scoring(rescore=True)  # bounded runs make progress: not rescored again
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM score_history").fetchone()[0], 1)
 
 

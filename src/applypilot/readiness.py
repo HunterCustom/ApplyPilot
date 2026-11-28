@@ -232,6 +232,7 @@ def queue(conn: sqlite3.Connection | None = None, status: str = "ready", limit: 
         "deferred": "review_status = 'deferred'",
         "rejected": "review_status = 'rejected'",
     }.get(status, "readiness = 'ready' AND review_status IS NULL")
-    rows = conn.execute(f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC, readiness_at DESC LIMIT ?",
-                        (limit,)).fetchall()
-    return [dict(r) for r in rows]
+    rows = conn.execute(f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC, readiness_at DESC",
+                        ()).fetchall()
+    from applypilot.ranking import rank
+    return rank([dict(r) for r in rows])[:limit]
