@@ -1197,7 +1197,7 @@ def _still_ready(job: dict) -> tuple[bool, list[str]]:
     row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
     if row is None:
         return False, ["job row disappeared"]
-    ok, reasons, _ = readiness.evaluate(dict(row), conn)
+    _ok, reasons, _ = readiness.evaluate(dict(row), conn)
     # In flight because *we* just claimed it -- that alone is not a blocker.
     reasons = [r for r in reasons if r != "application history: status is in_progress"]
     if reasons:

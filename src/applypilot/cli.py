@@ -570,7 +570,7 @@ def doctor() -> None:
 
 
 # Fork: operational commands (verify, dedupe, review, screening, report, daily).
-from applypilot import cli_ops as _cli_ops  # noqa: E402
+from applypilot import cli_ops as _cli_ops
 
 _cli_ops.register(app)
 

@@ -7,7 +7,7 @@ without migration ordering issues.
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 from applypilot.config import DB_PATH
@@ -268,7 +268,7 @@ def record_sighting(conn: sqlite3.Connection, url: str, source: str, *, company:
 
     Only fills fields that are still empty (first source wins) and never overwrites a stored
     posting date. ``date_posted`` must come from the source itself -- callers never guess it."""
-    now = now or datetime.now(timezone.utc).isoformat()
+    now = now or datetime.now(UTC).isoformat()
     conn.execute(
         "UPDATE jobs SET first_seen_at = COALESCE(first_seen_at, discovered_at, ?), last_seen_at = ?,"
         " seen_count = COALESCE(seen_count, 0) + 1, company = COALESCE(company, ?),"
@@ -286,7 +286,7 @@ def log_discovery_run(conn: sqlite3.Connection, *, run_id: str, source: str, que
     conn.execute(
         "INSERT INTO discovery_runs (run_id, source, query, started_at, finished_at, status, new_count,"
         " seen_count, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (run_id, source, query, started_at, datetime.now(timezone.utc).isoformat(), status, new_count,
+        (run_id, source, query, started_at, datetime.now(UTC).isoformat(), status, new_count,
          seen_count, (error or "")[:500] or None))
     conn.commit()
 

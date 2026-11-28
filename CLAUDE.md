@@ -34,7 +34,7 @@ Status and plan live in `PROJECT_STATUS.md`, `DEVELOPMENT_ROADMAP.md` and
 ## Commands (PowerShell, repo root)
 ```powershell
 $env:APPLYPILOT_DIR = "$HOME\.applypilot-dev"
-.\.venv\Scripts\python.exe -m pytest tests/ -q          # 190 tests (~65 s, real headless Chrome), temp DBs only
+.\.venv\Scripts\python.exe -m pytest tests/ -q          # ~255 tests (~90 s, real jailed headless Chrome), temp DBs only
 .\.venv\Scripts\python.exe -m ruff check <changed files> # repo-wide ruff has ~147 pre-existing findings; don't add new ones
 .\.venv\Scripts\applypilot.exe doctor                    # read-only setup check
 .\.venv\Scripts\applypilot.exe status                    # pipeline counts
@@ -57,6 +57,15 @@ Python 3.13 venv at `.venv`. Default LLM: local LM Studio at `http://127.0.0.1:1
 - `scoring/scorer.py` — LLM fit score 1–10; failed scores are not persisted (score=0 marker).
   `scoring/priority.py` (fork) — ordering only, never filters. `scoring/candidate_evidence.py` (fork).
 - `scoring/tailor.py`, `cover_letter.py`, `validator.py` (banned words + FABRICATION_WATCHLIST), `pdf.py` (Playwright Chromium).
+  Fork: `scoring/factcheck.py` (deterministic grounding, every mode), `scoring/documents.py` (approved vs
+  `rejected/` artifacts, staleness fingerprint). Only status `approved` sets `tailored_resume_path`.
+- Fork preparation modules: `verify.py` (posting check + freshness), `dedupe.py` (cross-source, never
+  deletes), `screening.py` (verified answers; sensitive -> human), `readiness.py` (ready gate + review),
+  `daily.py` (lock, limits, exit codes; never applies), `reports.py`, `opsconfig.py` (`pipeline.yaml`),
+  `cli_ops.py` (verify/dedupe/review/screening/report/daily commands). Operating guide: `DEPLOYMENT.md`.
+- `apply/proc_jail.py`: worker Chrome runs in a Job Object; non-Chrome children are killed. Never add tests
+  that activate mailto:/tel:/custom schemes (the OS handler launched the user's personal browser).
+
 - `apply/launcher.py` — acquires a job (SQLite `BEGIN IMMEDIATE`), launches Chrome with CDP,
   spawns a least-privilege `claude -p` via `build_agent_command` (`--tools ""`, `--setting-sources ""`,
   `dontAsk` + allowlist), verifies the init event (`verify_init_event`), audits hooks (`audit_session`),

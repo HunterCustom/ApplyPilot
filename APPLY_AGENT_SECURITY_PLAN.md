@@ -1,9 +1,23 @@
 # Apply Agent Security Plan
 
-_Status (2026-11-27, `fcf9e31`): **S1–S4 implemented**, S5 prompt change done, S6 not started.
-Verified by unit tests (`tests/test_apply_security.py`, synthetic only) and a live probe on local
-synthetic pages (`scripts/live_policy_probe.py`). No apply run (dry or real) has happened yet. Next
-security task was Phase 3b (below), now implemented and awaiting review._
+_Status (2026-11-27, completion pass `66b3c45`): S1–S6 implemented; Phase 3b implemented and the
+independent audit (`CODEX_PHASE3B_AUDIT.md`, verdict FAIL) answered below. No apply run (dry or real) has
+happened. Verified only on synthetic local pages. **Not certified submission-proof.**_
+
+## Audit response (CODEX_PHASE3B_AUDIT.md)
+| Finding | Fix | Evidence | Residual |
+|---|---|---|---|
+| H1 CDP loss releases held request | Proxy kill switch (`revoke`: abort tunnels, refuse new, re-check after dial) + write gate held while any write awaits approval; fail → revoke, kill Chrome, kill agent; live-target detach / unconfirmed failRequest = failure | `test_held_write_never_sent_when_controller_is_lost` (receiver: 0 POSTs), `ProxyGateTests` | Gate holds all browser→server bytes during an approval wait (pages stall; by design) |
+| H2 other tenants / safe-method data | Own ATS family only; top-level pages must stay on the job's subdomain tenant; OPTIONS only as real preflight; bodies, Ping/beacons, applicant values in URLs = writes; asset query ≤256 chars, no applicant values | `RequestRuleTests`, `test_unrelated_ats_providers_not_allowed` | Path-tenant ATSs (Greenhouse, Lever) are scoped by host only; JS GETs without applicant values that change state are not recognisable |
+| H3 evidence not causal | Applied needs approved submit → launcher-confirmed release → later confirmation; any released/ambiguous write makes other outcomes `needs_review`; guard sealed before outcome; Enter/type-submit counted | `test_real_run_evidence_needs_network_level_release`, `test_released_write_is_recorded_as_evidence`, classification tests | No job-specific receipt/application-ID parsing |
+| H4 mailto → OS handler (launched Vivaldi) | Worker Chrome in a Windows Job Object (suspended start, no breakaway, kill-on-close); any non-Chrome child terminated + guard failure; doc-start script blocks non-http link activation; external-scheme test fixtures removed | `ProcessJailTests` (cmd.exe child killed before it runs), `test_browser_runs_inside_the_process_jail` | Shell `DelegateExecute`/COM handoffs and IPC to an already-running app are not children; never test-triggered |
+| M1 approvals non-atomic | Exclusive-create markers (single consumer, irreversible withdraw), grant bound to the digest shown, action bound to request/target/frame/headers, incomplete bodies refused | `AtomicApprovalTests` (4 concurrent consumers → 1 wins) | DOM state at click time not bound |
+| M2 WebSocket tripwire | Page contexts lose WebSocket/WebTransport/RTCPeerConnection; worker WS still trips → revoke | `test_page_websocket_and_webrtc_removed`, `test_worker_websocket_stops_the_session` | Worker sockets: tripwire only |
+| M3 file-writing tools | Screenshot removed; `filename`/path args denied; Playwright MCP env overrides scrubbed; init must precede tool use; audit by tool-use id | `ToolSurfaceTests` | — |
+| M4 data on disk | Sanitized URLs (no userinfo/query/token segments) in logs; approval files hold display copy + digests (job URL hashed); approvals cancelled at session end; CLI escapes page text | `PersistenceAndProtocolTests` | Prepared PDFs and `--gen` prompt files still contain applicant data (by necessity / opt-in) |
+| M5 CDP client | RFC 6455 invariants, aggregate cap, bounded event tasks | `test_cdp_rejects_malformed_frames` | No heartbeat |
+| M6 worker scope | No zero-quota workers; exact target only (attempt cap, one worker); duplicates by effective URL + dedupe groups + readiness | `TargetSelectionTests`, `test_not_ready_or_unapproved_jobs_are_never_claimed` | Stale-claim recovery still age-based (→ needs_review, never retried) |
+| L1–L3 | Verification helper opt-in only; driver start-up robust; frame-scoped, consumed form signals | tests above | — |
 
 ## Phase 3b — launcher-owned network + submission boundary (implemented)
 - **Why two layers**: CDP `Fetch` sees method/URL/type/frame before sending (incl. redirect hops,
