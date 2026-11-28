@@ -379,7 +379,12 @@ def run_verification(limit: int | None = None, conn: sqlite3.Connection | None =
     timeout = float(cfg["verify_timeout_s"])
     robots, throttle = RobotsCache(fetch, timeout), HostThrottle(float(cfg["verify_delay_s"]))
     counts: dict[str, int] = {}
+    from applypilot import runctl
+    stopped_early = False
     for job in rows:
+        if runctl.expired():  # daily max_runtime_minutes (audit R5)
+            stopped_early = True
+            break
         try:
             res = check_posting(job, fetch=fetch, robots=robots, throttle=throttle, timeout=timeout)
         except Exception as e:  # noqa: BLE001 -- one bad page never stops the stage
@@ -392,4 +397,4 @@ def run_verification(limit: int | None = None, conn: sqlite3.Connection | None =
 
         conn.commit()
     log.info("verify: %d checked %s", len(rows), counts)
-    return {"status": "ok", "checked": len(rows), **counts}
+    return {"status": "ok", "checked": sum(counts.values()), "stopped_early": stopped_early, **counts}

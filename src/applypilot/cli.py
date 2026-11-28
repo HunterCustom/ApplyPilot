@@ -100,6 +100,22 @@ def run(
     ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
+    # Same OS-held lock as `applypilot daily` (audit R5): a manual run never overlaps a scheduled
+    # one, and database migrations only run while the lock is held.
+    from applypilot.config import APP_DIR
+    from applypilot.daily import EXIT_LOCKED, LOCK_NAME, RunLock
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    run_lock = RunLock(APP_DIR / LOCK_NAME)
+    if not run_lock.acquire():
+        console.print("[red]Another ApplyPilot run (daily or manual) is in progress; exiting.[/red]")
+        raise typer.Exit(code=EXIT_LOCKED)
+    try:
+        _run_locked(stages, min_score, workers, stream, dry_run, validation)
+    finally:
+        run_lock.release()
+
+
+def _run_locked(stages, min_score, workers, stream, dry_run, validation) -> None:
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline

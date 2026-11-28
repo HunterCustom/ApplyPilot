@@ -264,7 +264,12 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     results: list[dict] = []
     error_count = 0
 
+    from applypilot import runctl
+    stopped_early = False
     for job in jobs:
+        if runctl.expired():  # daily max_runtime_minutes (audit R5)
+            stopped_early = True
+            break
         completed += 1
         try:
             letter, report = generate_cover_letter(
@@ -347,4 +352,5 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         "generated": saved,
         "errors": error_count,
         "elapsed": elapsed,
+        "stopped_early": stopped_early,
     }

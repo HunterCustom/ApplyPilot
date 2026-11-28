@@ -560,7 +560,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
+    from applypilot import runctl
+    stopped_early = False
     for job in jobs:
+        if runctl.expired():  # daily max_runtime_minutes (audit R5)
+            stopped_early = True
+            break
         completed += 1
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
@@ -666,4 +671,5 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         "failed": rejected,
         "errors": stats.get("error", 0),
         "elapsed": elapsed,
+        "stopped_early": stopped_early,
     }

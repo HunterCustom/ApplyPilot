@@ -11,7 +11,6 @@ LLM and a fake HTTP fetcher. No network, browser, real profile or real database 
 """
 import atexit
 import json
-import os
 import sqlite3
 import tempfile
 import types
@@ -569,14 +568,19 @@ class ReadinessTests(TailorTests):
 
 class DailyTests(TempEnv):
     def test_overlap_prevented(self):
-        (self.app / daily.LOCK_NAME).write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+        holder = daily.RunLock(self.app / daily.LOCK_NAME)
+        self.assertTrue(holder.acquire())
+        self.addCleanup(holder.release)
         self.assertEqual(daily.run_daily(stage_fns={}, stages=["dedupe"]), daily.EXIT_LOCKED)
 
     def test_stale_lock_taken_over(self):
-        (self.app / daily.LOCK_NAME).write_text(json.dumps({"pid": 999999999}), encoding="utf-8")
+        # A record left by an owner that crashed (never released) does not block, and is reported.
+        (self.app / daily.LOCK_NAME).write_text(json.dumps({"pid": 999999999, "token": "old"}), encoding="utf-8")
         code = daily.run_daily(stages=["dedupe"], stage_fns={"dedupe": lambda: {"status": "ok"}})
         self.assertEqual(code, daily.EXIT_OK)
-        self.assertFalse((self.app / daily.LOCK_NAME).exists())
+        log = next((self.app / "logs").glob("daily-*.jsonl")).read_text(encoding="utf-8")
+        self.assertIn("stale_lock_recovered", log)
+        self.assertTrue(json.loads((self.app / daily.LOCK_NAME).read_text(encoding="utf-8"))["released"])
 
     def test_model_unavailable_skips_llm_stages_and_failures_do_not_stop_the_run(self):
         ran = []

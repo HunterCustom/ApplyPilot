@@ -10,16 +10,19 @@ import hashlib
 import http.server
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
 
-from test_preparation_pipeline import GOOD_JSON, PROFILE, FakeLLM, TailorTests
+from test_preparation_pipeline import GOOD_JSON, PROFILE, FakeLLM, TailorTests, TempEnv
 
-from applypilot import config, readiness
+from applypilot import config, database, readiness
 from applypilot.apply import chrome, launcher
 from applypilot.apply import prompt as prompt_mod
 from applypilot.scoring import cover_letter, tailor
@@ -563,6 +566,173 @@ class ScoreParsingTests(unittest.TestCase):
         b = scorer.score_config("evidence B", "resume")
         self.assertNotEqual(a["evidence_sha"], b["evidence_sha"])
         self.assertEqual(a["resume_sha"], b["resume_sha"])
+
+
+
+# --- R5: scheduler ownership, recovery, migrations ------------------------------------------------------
+
+from applypilot import daily, opsconfig, runctl
+
+_CONTENDER = r"""
+import json, sys, time
+from pathlib import Path
+from applypilot.daily import RunLock
+path, start, hold = Path(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+while time.time() < start:
+    time.sleep(0.001)
+lock = RunLock(path)
+got = lock.acquire()
+print(json.dumps({"acquired": got, "took_over": lock.took_over}), flush=True)
+if got:
+    time.sleep(hold)
+    if len(sys.argv) > 4 and sys.argv[4] == "crash":
+        import os
+        os._exit(9)   # die without releasing
+    lock.release()
+"""
+
+_MIGRATOR = r"""
+import sys, time
+from pathlib import Path
+from applypilot import database
+path, start = Path(sys.argv[1]), float(sys.argv[2])
+while time.time() < start:
+    time.sleep(0.001)
+conn = database.init_db(path)
+print(len(conn.execute("PRAGMA table_info(jobs)").fetchall()), flush=True)
+"""
+
+
+def _spawn(code, *args):
+    env = {**os.environ, "APPLYPILOT_DIR": tempfile.gettempdir()}
+    return subprocess.Popen([sys.executable, "-c", code, *map(str, args)], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, env=env)
+
+
+class SchedulerLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.lock = self.tmp / "daily.lock"
+
+    def results(self, procs, timeout=60):
+        out = []
+        for p in procs:
+            stdout, stderr = p.communicate(timeout=timeout)
+            self.assertTrue(stdout.strip(), stderr)
+            out.append(json.loads(stdout.strip().splitlines()[0]))
+        return out
+
+    def test_simultaneous_contenders_on_a_stale_lock_exactly_one_wins(self):
+        """Audit reproduction: two contenders read the same stale owner and both acquired."""
+        self.lock.write_text(json.dumps({"pid": 999999999, "token": "dead"}), encoding="utf-8")
+        start = time.time() + 2.0
+        procs = [_spawn(_CONTENDER, self.lock, start, 3.0) for _ in range(4)]
+        res = self.results(procs)
+        self.assertEqual(sum(r["acquired"] for r in res), 1, res)
+        winner = next(r for r in res if r["acquired"])
+        self.assertEqual(winner["took_over"]["token"], "dead")
+
+    def test_crashed_owner_is_recovered_without_a_race(self):
+        holder = _spawn(_CONTENDER, self.lock, 0, 1.0, "crash")
+        self.assertTrue(self.results([holder])[0]["acquired"])
+        nxt = _spawn(_CONTENDER, self.lock, 0, 0)
+        res = self.results([nxt])[0]
+        self.assertTrue(res["acquired"])
+        self.assertIsNotNone(res["took_over"])  # the crash is reported
+
+    def test_a_released_owner_cannot_remove_a_newer_owners_lock(self):
+        a = daily.RunLock(self.lock)
+        self.assertTrue(a.acquire())
+        a.release()
+        b = daily.RunLock(self.lock)
+        self.assertTrue(b.acquire())
+        self.addCleanup(b.release)
+        a.release()  # late/double release of the old owner
+        other = self.results([_spawn(_CONTENDER, self.lock, 0, 0)])[0]
+        self.assertFalse(other["acquired"])
+        self.assertTrue(self.lock.exists())
+
+    def test_an_empty_or_half_written_lock_file_does_not_grant_ownership_to_two(self):
+        self.lock.write_text("{\"pid\": 12", encoding="utf-8")  # torn write
+        start = time.time() + 1.5
+        res = self.results([_spawn(_CONTENDER, self.lock, start, 2.0) for _ in range(3)])
+        self.assertEqual(sum(r["acquired"] for r in res), 1, res)
+
+    def test_concurrent_bootstrap_of_an_old_schema_is_serialized(self):
+        import sqlite3
+        db = self.tmp / "old.db"
+        c = sqlite3.connect(db)
+        c.execute("CREATE TABLE jobs (url TEXT PRIMARY KEY, title TEXT, salary TEXT, description TEXT, location TEXT,"
+                  " site TEXT, strategy TEXT, discovered_at TEXT)")
+        c.execute("INSERT INTO jobs (url, title) VALUES ('https://x.test/1', 'kept')")
+        c.commit()
+        c.close()
+        start = time.time() + 2.0
+        procs = [_spawn(_MIGRATOR, db, start) for _ in range(4)]
+        counts = []
+        for p in procs:
+            stdout, stderr = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, stderr[-500:])
+            counts.append(int(stdout.strip()))
+        self.assertEqual(len(set(counts)), 1)
+        c = sqlite3.connect(db)
+        self.assertEqual(c.execute("SELECT title FROM jobs").fetchone()[0], "kept")  # history preserved
+        cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)")}
+        self.assertTrue({"resume_sha", "eligibility_input", "review_artifacts"} <= cols)
+        c.close()
+
+
+class DailyRunTests(TempEnv):
+    def test_stage_with_item_errors_is_not_success(self):
+        """Audit reproduction: a score stage with row errors and status ok produced exit 0."""
+        code = daily.run_daily(stages=["score"], check_model=lambda: (True, "ok"),
+                               stage_fns={"score": lambda: {"status": "ok", "scored": 3, "errors": 2}})
+        self.assertEqual(code, daily.EXIT_STAGE_FAILED)
+
+    def test_interrupted_runs_are_reconciled(self):
+        self.conn.execute("INSERT INTO pipeline_runs (run_id, kind, started_at, status) VALUES"
+                          " ('old', 'daily', '2026-11-01T00:00:00+00:00', 'running')")
+        self.conn.commit()
+        self.assertEqual(daily.run_daily(stages=["dedupe"], stage_fns={"dedupe": lambda: {"status": "ok"}}),
+                         daily.EXIT_OK)
+        row = self.conn.execute("SELECT status, finished_at FROM pipeline_runs WHERE run_id = 'old'").fetchone()
+        self.assertEqual(row[0], "interrupted")
+        self.assertIsNotNone(row[1])
+
+    def test_deadline_stops_inside_a_stage(self):
+        self.add("https://careers.synthbank.test/jobs/1", application_url="https://careers.synthbank.test/jobs/1")
+        calls = []
+
+        def fetch(url, timeout):
+            calls.append(url)
+            return 200, url, "<h1>IT Support Specialist</h1>" + "x " * 300
+
+        from applypilot import verify
+        runctl.set_deadline(time.monotonic() - 1)
+        self.addCleanup(runctl.clear)
+        out = verify.run_verification(fetch=fetch)
+        self.assertTrue(out["stopped_early"])
+        self.assertEqual(calls, [])
+        runctl.clear()
+        code = daily.run_daily(stages=["verify"], stage_fns={"verify": lambda: {"status": "ok", "stopped_early": True}})
+        self.assertEqual(code, daily.EXIT_STAGE_FAILED)
+
+    def test_manual_run_and_daily_share_the_lock(self):
+        holder = daily.RunLock(config.APP_DIR / daily.LOCK_NAME)
+        self.assertTrue(holder.acquire())
+        self.addCleanup(holder.release)
+        from typer.testing import CliRunner
+
+        from applypilot.cli import app
+        res = CliRunner().invoke(app, ["run", "dedupe"])
+        self.assertEqual(res.exit_code, daily.EXIT_LOCKED, res.output)
+
+    def test_plan_does_not_open_or_migrate_the_database(self):
+        database.close_connection(self.db_path)
+        self.db_path.unlink()
+        self.assertEqual(daily.run_daily(plan_only=True), daily.EXIT_OK)
+        self.assertFalse(self.db_path.exists())
+        self.assertIn("dedupe", opsconfig.DAILY_STAGES)
 
 
 if __name__ == "__main__":

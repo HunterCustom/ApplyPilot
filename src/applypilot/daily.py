@@ -35,61 +35,100 @@ LOCK_NAME = "daily.lock"
 
 # --- single instance ---------------------------------------------------------------------------------
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return ctypes.get_last_error() == 5  # access denied: exists
-        code = ctypes.c_ulong()
-        k32.GetExitCodeProcess(h, ctypes.byref(code))
-        k32.CloseHandle(h)
-        return code.value == 259  # STILL_ACTIVE
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+_LOCK_OFFSET = 1 << 30  # byte locked in the lock file (beyond the owner record, so it stays readable)
 
 
 class RunLock:
-    """Exclusive lock file. A lock whose owner process is gone is taken over (logged)."""
+    """OS-held exclusive lock (audit R5).
+
+    Ownership is an exclusive byte-range lock on ``path`` (``msvcrt.locking`` on Windows,
+    ``fcntl.flock`` elsewhere) held for the lifetime of the open handle. The operating system
+    releases it when the owner exits or crashes, so there is no stale-owner detection, no
+    unlink and no takeover race: two processes can never both hold it, and a released or dead
+    owner can never remove a newer owner's lock. The file itself is never deleted; it carries
+    a diagnostic owner record (pid, token, started, released). ``took_over`` reports a previous
+    owner that ended without releasing (crash / power loss).
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.held = False
         self.took_over: dict | None = None
+        self.token = uuid.uuid4().hex
+        self._fd: int | None = None
+
+    def _os_lock(self, fd: int) -> bool:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False
+            return True
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    def _os_unlock(self, fd: int) -> None:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def _read_record(self, fd: int) -> dict:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 4096)
+        try:
+            return json.loads(raw.decode("utf-8")) if raw.strip() else {}
+        except ValueError:
+            return {"unreadable": True}
+
+    def _write_record(self, fd: int, record: dict) -> None:
+        data = json.dumps(record).encode("utf-8")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+        os.fsync(fd)
 
     def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        for _ in range(2):
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                try:
-                    info = json.loads(self.path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    info = {}
-                if _pid_alive(int(info.get("pid", 0) or 0)):
-                    return False
-                self.took_over = info
-                self.path.unlink(missing_ok=True)  # stale: previous run crashed
-                continue
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"pid": os.getpid(), "started": datetime.now(UTC).isoformat()}, f)
-            self.held = True
+        if self.held:
             return True
-        return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        if not self._os_lock(fd):
+            os.close(fd)
+            return False
+        previous = self._read_record(fd)
+        if previous and not previous.get("released"):
+            self.took_over = previous  # the previous owner ended without releasing (crash)
+        self._write_record(fd, {"pid": os.getpid(), "token": self.token,
+                                "started": datetime.now(UTC).isoformat()})
+        self._fd = fd
+        self.held = True
+        return True
 
     def release(self) -> None:
-        if self.held:
-            self.path.unlink(missing_ok=True)
-            self.held = False
+        if not self.held or self._fd is None:
+            return
+        fd, self._fd, self.held = self._fd, None, False
+        try:
+            rec = self._read_record(fd)
+            if rec.get("token") == self.token:
+                rec["released"] = datetime.now(UTC).isoformat()
+                self._write_record(fd, rec)
+        finally:
+            self._os_unlock(fd)
+            os.close(fd)
 
 
 # --- structured log ----------------------------------------------------------------------------------
@@ -179,19 +218,30 @@ def _stage_fns(cfg: dict, min_score: int) -> dict[str, Callable[[], dict]]:
             "score": score, "tailor": tailor, "cover": cover, "pdf": pdf, "prepare": prepare}
 
 
+def _partial(name: str, result: dict) -> bool:
+    """A stage that reported per-item errors did not fully succeed (audit R5)."""
+    if name == "discover" and any(str(v).startswith("error") for v in result.values()):
+        return True
+    try:
+        return int(result.get("errors") or 0) > 0 or bool(result.get("stopped_early"))
+    except (TypeError, ValueError):
+        return True
+
+
 def run_daily(*, stages: list[str] | None = None, plan_only: bool = False,
               stage_fns: dict[str, Callable[[], dict]] | None = None,
               check_model: Callable[[], tuple[bool, str]] = model_available) -> int:
-    """Run the daily preparation pipeline. Returns the process exit code."""
+    """Run the daily preparation pipeline. Returns the process exit code.
+
+    The OS-held run lock is taken *before* the database is opened or migrated, so two
+    invocations (scheduled, manual or ``applypilot run``) never bootstrap or work concurrently."""
+    from applypilot import runctl
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
     try:
         config.load_env()
-        config.ensure_dirs()
-        from applypilot.database import init_db
-        conn = init_db()
         cfg = opsconfig.load()
     except Exception as e:  # noqa: BLE001
-        log.error("daily bootstrap failed: %s", e)
+        log.error("daily configuration failed: %s", e)
         return EXIT_CONFIG
     chosen = [s for s in (stages or cfg["daily"]["stages"]) if s in opsconfig.DAILY_STAGES]
     if not chosen:
@@ -201,17 +251,32 @@ def run_daily(*, stages: list[str] | None = None, plan_only: bool = False,
         print(f"Limits: {json.dumps(cfg['daily'])}  min_score={cfg['min_score']}")
         return EXIT_OK
 
+    try:
+        config.ensure_dirs()
+    except OSError as e:
+        log.error("daily bootstrap failed: %s", e)
+        return EXIT_CONFIG
     lock = RunLock(config.APP_DIR / LOCK_NAME)
     if not lock.acquire():
         print("Another daily run is in progress; exiting.")
         return EXIT_LOCKED
+    try:
+        from applypilot.database import init_db
+        conn = init_db()  # migrations run only while holding the lock
+    except Exception as e:  # noqa: BLE001
+        log.error("daily bootstrap failed: %s", e)
+        lock.release()
+        return EXIT_CONFIG
     rl = RunLog(run_id)
     started = datetime.now(UTC).isoformat()
+    # We hold the exclusive lock, so any run still marked 'running' was interrupted.
+    stale = conn.execute("UPDATE pipeline_runs SET status = 'interrupted', finished_at = COALESCE(finished_at, ?)"
+                         " WHERE kind = 'daily' AND status = 'running'", (started,)).rowcount
     conn.execute("INSERT INTO pipeline_runs (run_id, kind, started_at, status) VALUES (?, 'daily', ?, 'running')",
                  (run_id, started))
     conn.commit()
-    if lock.took_over:
-        rl.event("stale_lock_recovered", previous=lock.took_over)
+    if lock.took_over or stale:
+        rl.event("stale_lock_recovered", previous=lock.took_over, interrupted_runs=stale)
     exit_code = EXIT_OK
     summary: dict = {}
     try:
@@ -219,6 +284,7 @@ def run_daily(*, stages: list[str] | None = None, plan_only: bool = False,
         rl.event("start", stages=chosen, model=model_msg, model_ok=ok, limits=cfg["daily"])
         fns = stage_fns or _stage_fns(cfg, int(cfg["min_score"]))
         deadline = time.monotonic() + float(cfg["daily"]["max_runtime_minutes"]) * 60
+        runctl.set_deadline(deadline)
         for name in chosen:
             if time.monotonic() > deadline:
                 rl.event("stage_skipped", stage=name, reason="max_runtime_minutes reached")
@@ -235,7 +301,7 @@ def run_daily(*, stages: list[str] | None = None, plan_only: bool = False,
             try:
                 result = fns[name]() or {}
                 status = str(result.get("status", "ok"))
-                if name == "discover" and any(str(v).startswith("error") for v in result.values()):
+                if status == "ok" and _partial(name, result):
                     status = "partial"
             except Exception as e:
                 log.exception("daily stage %s failed", name)
@@ -246,10 +312,15 @@ def run_daily(*, stages: list[str] | None = None, plan_only: bool = False,
             if status not in ("ok",):
                 exit_code = EXIT_STAGE_FAILED
     finally:
-        conn.execute("UPDATE pipeline_runs SET finished_at = ?, status = ?, exit_code = ?, summary = ? WHERE run_id = ?",
-                     (datetime.now(UTC).isoformat(), "ok" if exit_code == EXIT_OK else "attention", exit_code,
-                      json.dumps(summary), run_id))
-        conn.commit()
-        rl.event("end", exit_code=exit_code, summary=summary)
-        lock.release()
+        runctl.clear()
+        try:
+            conn.execute("UPDATE pipeline_runs SET finished_at = ?, status = ?, exit_code = ?, summary = ?"
+                         " WHERE run_id = ?", (datetime.now(UTC).isoformat(),
+                                               "ok" if exit_code == EXIT_OK else "attention", exit_code,
+                                               json.dumps(summary), run_id))
+            conn.commit()
+            rl.event("end", exit_code=exit_code, summary=summary)
+        finally:
+            lock.release()
     return exit_code
+

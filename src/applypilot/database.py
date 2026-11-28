@@ -7,6 +7,7 @@ without migration ordering issues.
 
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 
@@ -43,8 +44,18 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
             pass
 
     conn = sqlite3.connect(path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
+    # Switching a database to WAL needs an exclusive lock and can fail immediately (no busy wait)
+    # while another process opens it at the same time; retry for a bounded time (audit R5).
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
     conn.row_factory = sqlite3.Row
     _local.connections[path] = conn
     return conn

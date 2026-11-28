@@ -198,7 +198,12 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         model = "unknown"
     cfg_json = json.dumps(score_config(evidence_text, resume_text), sort_keys=True)
 
+    from applypilot import runctl
+    stopped_early = False
     for index, job in enumerate(jobs, start=1):
+        if runctl.expired():  # daily max_runtime_minutes (audit R5)
+            stopped_early = True
+            break
         result = score_job(resume_text, job, evidence_text)
         if result["score"] == 0:
             errors += 1
@@ -235,5 +240,6 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         GROUP BY fit_score ORDER BY fit_score DESC
     """).fetchall()
     distribution = [(row[0], row[1]) for row in dist]
-    return {"scored": scored, "errors": errors, "elapsed": elapsed, "distribution": distribution}
+    return {"scored": scored, "errors": errors, "elapsed": elapsed, "distribution": distribution,
+            "stopped_early": stopped_early}
 
