@@ -17,7 +17,8 @@ from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-MAX_MESSAGE = 256 * 1024 * 1024
+MAX_MESSAGE = 256 * 1024 * 1024   # per assembled message (all fragments together)
+MAX_PENDING_EVENTS = 5000          # outstanding event handler tasks before the connection is failed
 
 
 class CDPError(RuntimeError):
@@ -49,6 +50,7 @@ class CDPConnection:
         self.closed = asyncio.Event()
         self.on_event: EventHandler | None = None
         self.on_close: Callable[[], None] | None = None
+        self._event_tasks: set[asyncio.Task] = set()
 
     async def connect(self, ws_url: str, timeout: float = 10.0) -> None:
         parts = urlsplit(ws_url)
@@ -92,6 +94,12 @@ class CDPConnection:
         assert self._reader is not None
         b1, b2 = await self._reader.readexactly(2)
         fin, opcode, masked, n = bool(b1 & 0x80), b1 & 0x0F, bool(b2 & 0x80), b2 & 0x7F
+        # RFC 6455 invariants (audit M5): servers never mask, no extensions are negotiated,
+        # reserved opcodes are errors, control frames are short and never fragmented.
+        if masked or b1 & 0x70 or opcode not in (0x0, 0x1, 0x2, 0x8, 0x9, 0xA):
+            raise CDPError("malformed CDP websocket frame")
+        if opcode >= 0x8 and (not fin or n > 125):
+            raise CDPError("malformed CDP control frame")
         if n == 126:
             (n,) = struct.unpack("!H", await self._reader.readexactly(2))
         elif n == 127:
@@ -115,14 +123,20 @@ class CDPConnection:
                 if opcode == 0xA:
                     continue
                 if opcode in (0x1, 0x2):
+                    if buf_op:
+                        raise CDPError("new message inside a fragmented one")
                     buf, buf_op = bytearray(data), opcode
                 elif opcode == 0x0:
+                    if not buf_op:
+                        raise CDPError("continuation without a message")
                     buf += data
+                if len(buf) > MAX_MESSAGE:
+                    raise CDPError("CDP message too large")
                 if not fin:
                     continue
                 if buf_op == 0x1:
                     self._dispatch(json.loads(bytes(buf).decode("utf-8")))
-                buf = bytearray()
+                buf, buf_op = bytearray(), 0
         except (asyncio.IncompleteReadError, ConnectionError, OSError, CDPError, ValueError):
             pass
         finally:
@@ -140,7 +154,13 @@ class CDPConnection:
         if self.on_event:
             res = self.on_event(msg.get("method", ""), msg.get("params", {}), msg.get("sessionId"))
             if asyncio.iscoroutine(res):
-                asyncio.get_running_loop().create_task(res)
+                if len(self._event_tasks) >= MAX_PENDING_EVENTS:
+                    res.close()
+                    raise CDPError("too many outstanding CDP events")
+                task = asyncio.get_running_loop().create_task(res)
+                self._event_tasks.add(task)
+                task.add_done_callback(self._event_tasks.discard)
+
 
     def _shutdown(self) -> None:
         if self.closed.is_set():

@@ -28,7 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from applypilot import config
-from applypilot.apply import approval, chrome, launcher, policy_hook
+from applypilot.apply import approval, chrome, launcher, policy_hook, proc_jail
 from applypilot.apply import network_policy as NP
 from applypilot.apply import policy as P
 from applypilot.apply.cdp import CDPConnection, browser_ws_url
@@ -121,7 +121,12 @@ class DecideRequestTests(TempDirCase):
 
     def test_dry_run_reads_allowed(self):
         self.assertEqual(self.d("https://careers.acme-corp.com/jobs/42").action, "allow")
-        self.assertEqual(self.d("https://boards.greenhouse.io/x", method="OPTIONS", rtype="Preflight", main=False).action, "allow")
+        pre = NP.decide_request(make_policy(self.tmp), url="https://boards.greenhouse.io/x", method="OPTIONS",
+                                resource_type="Preflight", headers={"Access-Control-Request-Method": "POST"})
+        self.assertEqual(pre.action, "allow")
+        # OPTIONS without the preflight header (script-made) or with a body is state-changing (audit H2)
+        self.assertEqual(self.d("https://boards.greenhouse.io/x", method="OPTIONS", rtype="Fetch", main=False).action,
+                         "block")
 
     def test_real_run_state_changing_requests_need_approval(self):
         dec = self.d("https://careers.acme-corp.com/apply", method="POST", rtype="XHR", dry_run=False)
@@ -187,12 +192,16 @@ class ApprovalTests(TempDirCase):
         other_session = self.tmp.parent / "session-other"
         shutil.copytree(self.tmp, other_session)
         self.assertFalse(approval.consume(other_session, r["nonce"], job_url=JOB_URL, digest=r["digest"], now=1002))
-        # tampered request action (digest no longer matches its own action)
+        # tampered request digest on disk: no longer matches the enforcing caller's in-memory action
         path = self.tmp / approval.APPROVAL_DIR / f"req-{r['nonce']}.json"
         data = json.loads(path.read_text())
-        data["action"]["url"] = "https://careers.acme-corp.com/tampered"
+        self.assertNotIn("action", data)  # only a sanitized display copy is persisted (audit M4)
+        data["digest"] = other
         path.write_text(json.dumps(data))
         self.assertFalse(approval.consume(self.tmp, r["nonce"], job_url=JOB_URL, digest=r["digest"], now=1002))
+        # a grant for a request the human was not shown is refused
+        r2 = self.req()
+        self.assertFalse(approval.grant(self.tmp, r2["nonce"], now=1001, expected_digest=other))
 
     def test_malformed_nonces_rejected(self):
         for nonce in ("", "abc", "../../etc", "Z" * 32, None):
@@ -270,13 +279,21 @@ class HookGuardTests(TempDirCase):
         (self.tmp / P.GUARD_FAILED_FILE).write_text("x")
         self.assertEqual(launcher.audit_session(self.tmp, 1), "uncertain:network_guard_failed")
 
-    def test_real_run_evidence_needs_network_level_approval(self):
+    def test_real_run_evidence_needs_network_level_release(self):
         pol = make_policy(self.tmp, dry_run=False)
         P.record_audit(pol, {"phase": "pre", "tool": "x", "decision": "allow", "submit_approved": True})
         P.record_audit(pol, {"phase": "post", "tool": "x", "evidence": "confirmation_text"})
-        self.assertEqual(launcher.submission_evidence(self.tmp), (False, True))
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"]), (False, True, False))
+        # a grant alone is not a release, and a confirmation seen *before* the release proves nothing
         P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True})
-        self.assertEqual(launcher.submission_evidence(self.tmp), (True, True))
+        P.record_audit(pol, {"phase": "network", "net_release": "released"})
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["approved"], ev["released"], ev["correlated"]), (True, 1, False))
+        time.sleep(0.01)
+        P.record_audit(pol, {"phase": "post", "tool": "x", "evidence": "confirmation_text"})
+        self.assertTrue(launcher.submission_evidence(self.tmp)["correlated"])
+
 
 
 # --- Synthetic servers ---------------------------------------------------------------
@@ -343,7 +360,10 @@ def app_server(hits: Hits, forbidden_url: str):
                   ".catch(()=>0)));",
         "/popup": f"""<button id=b onclick="window.open('{F}/popup')">Apply</button>""",
         "/ws": """<script>try{new WebSocket('ws://'+location.host+'/socket')}catch(e){}</script>""",
-        "/mailto": """<a id=b href="mailto:jobs@acme-corp.example?subject=Application">Apply by email</a>""",
+        "/ws-worker": """<script>var w=new Worker('/ws-worker.js');</script>""",
+        "/ws-worker.js": "try{new WebSocket('ws://'+location.host+'/socket-w')}catch(e){}",
+        # No mailto:/tel: or other external-scheme fixture on purpose: activating one can hand the URL
+        # to the operating system's default handler (audit H4 -- it started a personal browser).
     }
 
     class H(http.server.BaseHTTPRequestHandler):
@@ -482,8 +502,14 @@ class Driver:
     def start(self):
         async def go():
             await self.conn.connect(browser_ws_url(self.port))
-            targets = (await self.conn.send("Target.getTargets"))["targetInfos"]
-            page = next(t for t in targets if t["type"] == "page")
+            page = None
+            for _ in range(50):  # the initial tab can be replaced during start-up (audit L2)
+                targets = (await self.conn.send("Target.getTargets"))["targetInfos"]
+                page = next((t for t in targets if t["type"] == "page"), None)
+                if page:
+                    break
+                await asyncio.sleep(0.1)
+            assert page is not None, "no page target"
             self.sid = (await self.conn.send("Target.attachToTarget",
                                              {"targetId": page["targetId"], "flatten": True}))["sessionId"]
             await self.conn.send("Page.enable", {}, self.sid)
@@ -503,6 +529,12 @@ class Driver:
                 await self.conn.send("Runtime.evaluate", {"expression": expr, "userGesture": True}, self.sid)
             await asyncio.sleep(settle)
         self.run(go())
+
+    def eval(self, expr):
+        async def go():
+            r = await self.conn.send("Runtime.evaluate", {"expression": expr, "returnByValue": True}, self.sid)
+            return r.get("result", {}).get("value")
+        return self.run(go())
 
     def press_enter(self, settle=1.2):
         async def go():
@@ -547,7 +579,12 @@ class BrowserBoundaryTests(TempDirCase):
         port = free_port()
         assert CHROME is not None
         cmd = chrome.chrome_command(CHROME, port, profile, True, self.guard.proxy_port if with_proxy else None)
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Same containment as the launcher: Chrome runs in a process jail; any other program it
+        # starts is terminated and fails the guard (audit H4).
+        self.escapes = []
+        self.jail = proc_jail.ProcessJail([CHROME], lambda why: (self.escapes.append(why), self.guard.fail(why)))
+        self.addCleanup(self.jail.close)
+        self.proc = self.jail.spawn(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(self._kill_chrome)
         for _ in range(100):
             try:
@@ -668,17 +705,25 @@ class BrowserBoundaryTests(TempDirCase):
         self.assertEqual(self.held("apply-sw"), [("POST", "block")])
         self.assertFalse(self.guard.failed.is_set())
 
-    def test_websocket_stops_the_session(self):
+    def test_page_websocket_and_webrtc_removed(self):
         self.launch()
-        self.driver.navigate(self.A + "/ws", settle=1.5)
+        self.driver.navigate(self.A + "/ws", settle=1.0)
+        self.assertEqual(self.driver.eval("[typeof WebSocket, typeof RTCPeerConnection, typeof WebTransport]"
+                                          ".join()"), "undefined,undefined,undefined")
+        self.assertEqual(self.app_hits.count("GET", "/socket"), 0)
+        self.assertFalse(self.guard.failed.is_set())
+
+    def test_worker_websocket_stops_the_session(self):
+        self.launch()
+        self.driver.navigate(self.A + "/ws-worker", settle=2.0)
         self.assertTrue(self.guard.failed.is_set())
         self.assertIsNotNone(P.network_guard_problem(self.policy))
 
-    def test_mailto_application_stops_for_human(self):
+    def test_browser_runs_inside_the_process_jail(self):
         self.launch()
-        self.driver.navigate(self.A + "/mailto")
-        self.driver.js("document.getElementById('b').click()")
-        self.assertTrue(any("mailto" in v["reason"] for v in self.violations()))
+        self.assertTrue(self.jail.contains(self.proc.pid))
+        self.driver.navigate(self.A + "/", settle=0.5)
+        self.assertEqual(self.escapes, [])
 
     # -- real-run approval at the network layer --
     def test_real_run_post_needs_single_use_grant(self):
@@ -713,7 +758,45 @@ class BrowserBoundaryTests(TempDirCase):
         self.assertIn("proxy", str(cm.exception))
         self.assertIsNotNone(P.network_guard_problem(self.policy))
 
+    def test_held_write_never_sent_when_controller_is_lost(self):
+        """Audit H1 regression, receiver side: a POST held for approval when CDP drops never arrives."""
+        self.launch(dry_run=False, approval_timeout_s=20)
+        self.driver.navigate(self.A + "/js-submit")
+        self.driver.js("fetch('/apply-js',{method:'POST',body:'held'}).catch(()=>0)", settle=0.2)
+        adir = self.tmp / approval.APPROVAL_DIR
+        for _ in range(100):
+            if adir.exists() and list(adir.glob("req-*.json")):
+                break
+            time.sleep(0.05)
+        self.assertTrue(list(adir.glob("req-*.json")), "the POST was not held for approval")
+        asyncio.run_coroutine_threadsafe(self._drop(), self.guard.loop).result(5)
+        time.sleep(2.5)  # Chrome releases its held requests when the controller disappears
+        self.assertTrue(self.guard.failed.is_set())
+        self.assertEqual(self.app_hits.count("POST", "/apply-js"), 0)
+        self.assertTrue(self.guard.proxy.revoked)
+
+    def test_released_write_is_recorded_as_evidence(self):
+        self.launch(dry_run=False, approval_timeout_s=10)
+        self.driver.navigate(self.A + "/js-submit")
+
+        def approve():
+            adir = self.tmp / approval.APPROVAL_DIR
+            for _ in range(100):
+                reqs = list(adir.glob("req-*.json")) if adir.exists() else []
+                if reqs:
+                    approval.grant(self.tmp, json.loads(reqs[0].read_text())["nonce"])
+                    return
+                time.sleep(0.05)
+        t = threading.Thread(target=approve)
+        t.start()
+        self.driver.js("fetch('/apply-js',{method:'POST',body:'one'}).catch(()=>0)", settle=2.0)
+        t.join()
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["released"], ev["ambiguous"]), (1, 0))
+        self.assertEqual(self.app_hits.count("POST", "/apply-js"), 1)
+
     def test_lost_controller_connection_fails_closed(self):
+
         self.launch()
         killed = threading.Event()
         self.guard.on_failure = killed.set

@@ -16,6 +16,12 @@ forwarded as plain HTTP.
 
 The proxy only sees hosts for HTTPS; methods, paths and bodies are decided by
 the CDP controller (``network_guard``) before Chrome sends them.
+
+Independent of CDP (audit H1): :meth:`EgressProxy.revoke` closes every open
+tunnel and refuses all later connections, and :meth:`hold` closes a write gate
+so no browser->server byte crosses *any* tunnel while a state-changing request
+is waiting for a human. If the CDP controller is lost while a request is held
+(Chrome then releases it), the bytes stop at the gate and the tunnel is revoked.
 """
 from __future__ import annotations
 
@@ -59,6 +65,43 @@ class EgressProxy:
         self.selftest_seen: dict[str, bool] = {}  # kind -> came through the proxy (absolute-form)
         self._server: asyncio.base_events.Server | None = None
         self.port = 0
+        self.revoked = False
+        self._writers: set[asyncio.StreamWriter] = set()
+        self._holds = 0
+        self._gate = asyncio.Event()
+        self._gate.set()
+
+    # --- independent kill switch / write gate (audit H1) ---------------------------
+    def revoke(self) -> None:
+        """Close every connection now and refuse all later ones. Irreversible. Loop thread only."""
+        self.revoked = True
+        self._gate.set()  # wake waiters so they observe the revocation and drop their data
+        for w in list(self._writers):
+            try:
+                w.transport.abort()
+            except Exception:
+                logger.debug("proxy revoke: abort failed", exc_info=True)
+        self._writers.clear()
+
+    def hold(self) -> None:
+        """Stop forwarding browser->server bytes on every tunnel (nested). Loop thread only."""
+        self._holds += 1
+        self._gate.clear()
+
+    def release(self) -> None:
+        self._holds = max(0, self._holds - 1)
+        if self._holds == 0:
+            self._gate.set()
+
+    async def _upstream_ok(self) -> bool:
+        """Wait at the write gate; False once revoked (the caller must drop the data)."""
+        while not self._gate.is_set() and not self.revoked:
+            await self._gate.wait()
+        return not self.revoked
+
+    def _track(self, *writers: asyncio.StreamWriter) -> None:
+        for w in writers:
+            self._writers.add(w)
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0, limit=_HEAD_LIMIT)
@@ -100,6 +143,16 @@ class EgressProxy:
             logger.debug("proxy event log failed", exc_info=True)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.revoked:
+            writer.transport.abort()
+            return
+        self._track(writer)
+        try:
+            await self._handle_inner(reader, writer)
+        finally:
+            self._writers.discard(writer)
+
+    async def _handle_inner(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
         except (TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
@@ -137,10 +190,20 @@ class EgressProxy:
             self._log(kind="connect", host=host, port=port, decision="error")
             await self._reply(writer, 502, "Bad Gateway")
             return
+        self._track(up_w)
+        if self.revoked or self.get_policy() is None:
+            # The guard failed while we were resolving / dialing: never open the tunnel.
+            up_w.transport.abort()
+            self._writers.discard(up_w)
+            await self._reply(writer, 403, "Forbidden")
+            return
         self._log(kind="connect", host=host, port=port, decision="allow")
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
-        await _pipe(reader, writer, up_r, up_w)
+        try:
+            await _pipe(reader, writer, up_r, up_w, self._upstream_ok)
+        finally:
+            self._writers.discard(up_w)
 
     async def _plain(self, method: str, target: str, header_lines: list[str], reader, writer) -> None:
         parts = urlsplit(target)
@@ -189,6 +252,11 @@ class EgressProxy:
                 return
         body = await reader.readexactly(length) if length else b""
         up_r, up_w = await asyncio.wait_for(asyncio.open_connection(host, port), self.connect_timeout)
+        self._track(up_w)
+        if not await self._upstream_ok():
+            up_w.transport.abort()
+            writer.transport.abort()
+            return
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -204,10 +272,15 @@ class EgressProxy:
             writer.close()
 
 
-async def _pipe(r1, w1, r2, w2) -> None:
-    async def copy(src, dst):
+async def _pipe(r1, w1, r2, w2, upstream_ok=None) -> None:
+    """Copy both directions. Browser->server chunks pass ``upstream_ok`` (gate) first."""
+    async def copy(src, dst, gated):
         try:
             while chunk := await src.read(65536):
+                if gated and upstream_ok is not None and not await upstream_ok():
+                    w1.transport.abort()
+                    w2.transport.abort()
+                    return
                 dst.write(chunk)
                 await dst.drain()
         except (ConnectionError, OSError):
@@ -218,4 +291,4 @@ async def _pipe(r1, w1, r2, w2) -> None:
             except (ConnectionError, OSError):
                 pass
 
-    await asyncio.gather(copy(r1, w2), copy(r2, w1))
+    await asyncio.gather(copy(r1, w2, True), copy(r2, w1, False))

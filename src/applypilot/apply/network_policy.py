@@ -38,6 +38,10 @@ STATIC_ASSET_HOSTS = (
 ASSET_RESOURCE_TYPES = frozenset({"Stylesheet", "Image", "Media", "Font", "Script", "TextTrack", "Manifest"})
 # Methods that do not carry an application body. Everything else is state-changing.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# Resource types that exist to transmit data (navigator.sendBeacon, <a ping>, CSP reports):
+# state-changing whatever their method.
+TRANSMIT_TYPES = frozenset({"Ping", "CSPViolationReport", "SignedExchange"})
+ASSET_MAX_QUERY = 256  # static assets need no long, data-bearing query strings
 LOCAL_SCHEMES = frozenset({"data", "blob"})  # never leave the browser
 NETWORK_SCHEMES = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
 
@@ -107,9 +111,40 @@ def _as_http(url: str) -> str:
     return f"{mapped}{sep}{rest}" if mapped else url
 
 
+def _is_preflight(method: str, headers: dict | None, has_body: bool) -> bool:
+    """A browser-generated CORS preflight: OPTIONS, no body, Access-Control-Request-Method set."""
+    names = {str(k).lower() for k in (headers or {})}
+    return method == "OPTIONS" and not has_body and "access-control-request-method" in names
+
+
+def carries_sensitive(url: str, tokens: list[str] | None) -> bool:
+    """True if any applicant value (email, phone digits, name ...) appears in the URL."""
+    if not tokens:
+        return False
+    from urllib.parse import unquote_plus
+    hay = unquote_plus(unquote_plus(url)).lower()
+    digits = "".join(ch for ch in hay if ch.isdigit())
+    for t in tokens:
+        t = (t or "").strip().lower()
+        if len(t) < 4:
+            continue
+        if t.isdigit():
+            if len(t) >= 7 and t in digits:
+                return True
+        elif t in hay:
+            return True
+    return False
+
+
 def decide_request(policy: P.SessionPolicy, *, url: str, method: str, resource_type: str,
-                   is_main_frame: bool = False, form_submission: bool = False) -> RequestDecision:
-    """Decide one browser request before it is sent. Pure; callers enforce the result."""
+                   is_main_frame: bool = False, form_submission: bool = False,
+                   headers: dict | None = None, has_body: bool = False,
+                   sensitive_tokens: list[str] | None = None) -> RequestDecision:
+    """Decide one browser request before it is sent. Pure; callers enforce the result.
+
+    State-changing = any method other than GET/HEAD, a real CORS preflight excepted; any request
+    with a body; a GET form submission; a beacon/ping/report; or any request whose URL carries
+    an applicant value (data can leave in a GET query just as well as in a POST body)."""
     method = (method or "").upper()
     try:
         scheme = urlsplit(url).scheme.lower()
@@ -126,12 +161,28 @@ def decide_request(policy: P.SessionPolicy, *, url: str, method: str, resource_t
     if why:
         private = is_private_destination(http_url)
         asset_ok = (not private and resource_type in ASSET_RESOURCE_TYPES and method in ("GET", "HEAD")
+                    and not has_body and len(urlsplit(url).query) <= ASSET_MAX_QUERY
+                    and not carries_sensitive(url, sensitive_tokens)
                     and P.url_block_reason(http_url, list(policy.asset_hosts)) is None)
         if not asset_ok:
             return RequestDecision("block", why, terminal=private or (is_document and is_main_frame))
+    elif is_document and is_main_frame:
+        tenant = P.tenant_block_reason(http_url, list(policy.tenant_hosts))
+        if tenant:
+            return RequestDecision("block", tenant, terminal=True)
 
-    if method not in SAFE_METHODS or (is_document and form_submission):
-        what = "form submission" if form_submission else f"{method} {resource_type or 'request'}"
+
+    writes = ((method not in ("GET", "HEAD") and not _is_preflight(method, headers, has_body))
+              or has_body or (is_document and form_submission) or resource_type in TRANSMIT_TYPES)
+    if not writes and carries_sensitive(url, sensitive_tokens):
+        writes = True
+        form_submission = False
+        method_desc = f"{method} with applicant data in the URL"
+    else:
+        method_desc = f"{method} {resource_type or 'request'}"
+    if writes:
+        what = "form submission" if form_submission else method_desc
+
         if policy.dry_run:
             return RequestDecision("block", f"dry run: {what} would transmit data", boundary=True)
         return RequestDecision("approve", f"{what} needs a human approval")

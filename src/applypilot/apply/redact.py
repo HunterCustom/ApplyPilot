@@ -27,6 +27,23 @@ _SENSITIVE_KEYS = {
 }
 
 
+_TOKENISH_RE = re.compile(r"^(?=.*\d)[A-Za-z0-9_\-.=~%+]{20,}$|^[A-Fa-f0-9-]{24,}$")
+
+
+def safe_url(url: str, limit: int = 200) -> str:
+    """URL safe to persist or display (audit M4): scheme, host and port only from the authority
+    (no userinfo), no query or fragment, and long token-like path segments masked."""
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        p = urlsplit(url)
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+    except ValueError:
+        return "(unparseable)"
+    segs = ["[token]" if _TOKENISH_RE.match(s) or _EMAIL_RE.search(s) else s for s in p.path.split("/")]
+    return urlunsplit((p.scheme, host + port, "/".join(segs), "", ""))[:limit]
+
+
 def _collect(obj, out: list[tuple[str, str]], key: str = "") -> None:
     if isinstance(obj, dict):
         for k, v in obj.items():

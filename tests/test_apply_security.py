@@ -63,8 +63,15 @@ class FakeGuard:
         self.failed = threading.Event()
         self.failure_reason = ""
         self.on_failure = self.on_approval_request = None
+        self.kill_browser = None
+        self.sensitive_tokens = []
         self.fail_activate = fail_activate
         self.activated = False
+        self.sealed = False
+
+    def seal(self):
+        self.sealed = True
+
 
     def activate(self, policy, port):
         if self.fail_activate:
@@ -161,10 +168,21 @@ class NavigationPolicyTests(unittest.TestCase):
 
     def test_allowed(self):
         for url in ("https://careers.acme-corp.com/jobs/42", "https://apply.acme-corp.com/x",
-                    "https://acme.wd5.myworkdayjobs.com/en-US/External/job/1",
-                    "https://job-boards.greenhouse.io/acme/jobs/1", "https://www.indeed.com/viewjob?jk=1",
-                    "about:blank"):
+                    "https://www.indeed.com/viewjob?jk=1", "about:blank"):
             self.assertIsNone(P.url_block_reason(url, self.HOSTS), url)
+
+    def test_unrelated_ats_providers_not_allowed(self):
+        # Audit H2: a job on the employer's own site gets no ATS provider; an ATS job only its family.
+        for url in ("https://acme.wd5.myworkdayjobs.com/en-US/External/job/1",
+                    "https://job-boards.greenhouse.io/acme/jobs/1"):
+            self.assertIsNotNone(P.url_block_reason(url, self.HOSTS), url)
+        wd = P.session_allowed_hosts({"url": "https://acme.wd5.myworkdayjobs.com/en-US/External/job/1"})
+        self.assertIn("*.myworkday.com", wd)
+        self.assertNotIn("*.greenhouse.io", wd)
+        tenants = P.session_tenant_hosts({"url": "https://acme.wd5.myworkdayjobs.com/en-US/External/job/1"})
+        self.assertEqual(tenants, ["acme.wd5.myworkdayjobs.com"])
+        self.assertIsNone(P.tenant_block_reason("https://acme.wd5.myworkdayjobs.com/x", tenants))
+        self.assertIsNotNone(P.tenant_block_reason("https://other.wd1.myworkdayjobs.com/x", tenants))
 
     def test_malicious_and_local_targets_blocked(self):
         for url in (
@@ -243,7 +261,7 @@ class PolicyHookTests(TempDirCase):
 
     def test_post_hook_allows_approved_page(self):
         pol = make_policy(self.tmp)
-        resp = "- Page URL: https://acme.wd5.myworkdayjobs.com/External/apply"
+        resp = "- Page URL: https://apply.acme-corp.com/External/apply"
         with mock.patch("sys.stdout", io.StringIO()):
             policy_hook.handle_post(pol, {"tool_name": PW + "browser_click", "tool_response": resp})
         self.assertFalse(P.session_halted(pol))
@@ -283,7 +301,8 @@ class SubmitApprovalTests(TempDirCase):
         event = {"tool_name": PW + "browser_click", "tool_input": {"element": "Submit application"}}
         with mock.patch("sys.stderr", io.StringIO()), mock.patch.object(policy_hook.time, "sleep", lambda s: None):
             self.assertEqual(policy_hook.handle_pre(pol, event), 2)
-        self.assertEqual(launcher.submission_evidence(self.tmp), (False, False))
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["approved"], ev["confirmed"]), (False, False))
 
     def test_real_run_submit_allowed_after_out_of_band_grant(self):
         pol = make_policy(self.tmp, dry_run=False, approval_timeout_s=20)
@@ -294,7 +313,7 @@ class SubmitApprovalTests(TempDirCase):
                 reqs = list((self.tmp / approval.APPROVAL_DIR).glob("req-*.json"))
                 if reqs:
                     req = json.loads(reqs[0].read_text())
-                    self.assertEqual((req["kind"], req["job_url"]), ("click", JOB["url"]))
+                    self.assertEqual((req["kind"], req["job"]), ("click", approval._job_key(JOB["url"])))
                     self.assertFalse(P.approve_submission(self.tmp, "0" * 32))
                     self.assertTrue(P.approve_submission(self.tmp, req["nonce"]))
                     return
@@ -309,10 +328,17 @@ class SubmitApprovalTests(TempDirCase):
         with mock.patch("sys.stdout", io.StringIO()):
             policy_hook.handle_post(pol, {"tool_name": PW + "browser_click",
                                           "tool_response": "Thank you for applying! - Page URL: https://careers.acme-corp.com/done"})
-        # the click approval alone is not evidence: the network guard must also have released the request
-        self.assertEqual(launcher.submission_evidence(self.tmp), (False, True))
-        P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True})
-        self.assertEqual(launcher.submission_evidence(self.tmp), (True, True))
+        # the click approval alone is not evidence: the network guard must also have released the
+        # request, and confirmation text only counts when it is seen after that release (audit H3)
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"]), (False, False, False))
+        P.record_audit(pol, {"phase": "network", "net_release": "released"})
+        time.sleep(0.01)
+        with mock.patch("sys.stdout", io.StringIO()):
+            policy_hook.handle_post(pol, {"tool_name": PW + "browser_snapshot",
+                                          "tool_response": "Thank you for applying! - Page URL: https://careers.acme-corp.com/done"})
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"]), (True, True, True))
 
 
 class CliSubmissionGateTests(TempDirCase):
@@ -365,7 +391,16 @@ class ClassificationTests(TempDirCase):
         self.assertEqual(self.classify("RESULT:APPLIED", submit_attempts=1, submit_approved=True),
                          "uncertain:applied_without_evidence")
         self.assertEqual(self.classify("RESULT:APPLIED", submit_attempts=1, submit_approved=True,
-                                       confirmation_seen=True), "applied")
+                                       confirmation_seen=True), "uncertain:applied_without_evidence")
+        self.assertEqual(self.classify("RESULT:APPLIED", submit_attempts=1, submit_approved=True,
+                                       confirmation_seen=True, released_writes=1, evidence_correlated=True),
+                         "applied")
+        # a released write that ends in an ordinary failure is never retried automatically
+        self.assertEqual(self.classify("RESULT:FAILED:page_error", released_writes=1),
+                         "uncertain:after_released_write:failed:page_error")
+        self.assertEqual(self.classify("RESULT:APPLIED", submit_approved=True, released_writes=1,
+                                       ambiguous_writes=1, evidence_correlated=True),
+                         "uncertain:applied_without_evidence")
 
     def test_security_and_audit_results_override_agent_claims(self):
         self.assertEqual(self.classify("RESULT:DRY_RUN", dry_run=True, security_failure="x"),
@@ -660,7 +695,7 @@ class RunJobTests(TempDirCase):
         def setup(session):
             (session / "hook_alive").write_text("1")
             pol = P.SessionPolicy.load(session / "policy.json")
-            P.record_audit(pol, {"phase": "pre", "tool": PW + "browser_navigate", "decision": "allow"})
+            P.record_audit(pol, {"phase": "pre", "tool": PW + "browser_navigate", "decision": "allow", "id": "t1"})
             # the guard loses enforcement while the agent runs
             (session / P.GUARD_FAILED_FILE).write_text("lost CDP")
             guard.failed.set()
@@ -689,7 +724,8 @@ class RunJobTests(TempDirCase):
         def setup(session):
             (session / "hook_alive").write_text("1")
             pol = P.SessionPolicy.load(session / "policy.json")
-            P.record_audit(pol, {"phase": "pre", "tool": PW + "browser_fill_form", "decision": "allow"})
+            P.record_audit(pol, {"phase": "pre", "tool": PW + "browser_fill_form", "decision": "allow", "id": "t1"})
+
 
         fill = {"type": "assistant", "message": {"content": [
             {"type": "text", "text": "Typing testy.applicant@example.org and (919) 555-0142, pw Sup3r-S3cret!pw"},

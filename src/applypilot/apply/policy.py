@@ -34,9 +34,10 @@ VERIFY_PREFIX = "mcp__applypilot_verify__"
 ALLOWED_BROWSER_TOOLS = (
     "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_click",
     "browser_type", "browser_fill_form", "browser_select_option", "browser_file_upload",
-    "browser_tabs", "browser_take_screenshot", "browser_wait_for", "browser_handle_dialog",
-    "browser_press_key",
+    "browser_tabs", "browser_wait_for", "browser_handle_dialog", "browser_press_key",
 )
+# Tool arguments that are never accepted: they make Playwright write files (audit M3).
+FORBIDDEN_TOOL_ARGS = ("filename", "path", "outputDir", "output_dir")
 VERIFY_TOOL = VERIFY_PREFIX + "get_verification_code"
 
 # Known-dangerous tools exposed by @playwright/mcp that must never run.
@@ -45,6 +46,8 @@ DENIED_BROWSER_TOOLS = (
     "browser_network_request", "browser_network_requests", "browser_console_messages",
     "browser_drag", "browser_drop", "browser_emulate_media", "browser_resize", "browser_close",
     "browser_find", "browser_hover", "browser_pdf_save", "browser_generate_locator",
+    "browser_take_screenshot", "browser_start_tracing", "browser_stop_tracing", "browser_mouse_click_xy",
+    "browser_mouse_move_xy", "browser_mouse_drag_xy", "browser_verify_element_visible",
 )
 
 
@@ -75,6 +78,19 @@ ATS_DOMAINS = (
     "avature.net", "brassring.com", "governmentjobs.com", "schooljobs.com",
     "jazzhr.com", "rippling.com", "pinpointhq.com", "teamtailor.com",
 )
+# Provider families: a job on one member may use the others (same vendor, shared login/CDN hosts).
+ATS_FAMILIES = (
+    ("myworkdayjobs.com", "myworkdaysite.com", "myworkday.com", "workday.com"),
+    ("successfactors.com", "successfactors.eu", "sapsf.com"),
+    ("taleo.net", "oraclecloud.com"),
+    ("ultipro.com", "ukg.com"),
+    ("governmentjobs.com", "schooljobs.com"),
+)
+# ATSs whose tenant is the subdomain (acme.wd5.myworkdayjobs.com): top-level pages must stay on
+# the job's own tenant host, never another employer's tenant on the same provider (audit H2).
+SUBDOMAIN_TENANT_ATS = ("myworkdayjobs.com", "myworkdaysite.com", "icims.com", "taleo.net", "bamboohr.com",
+                        "applytojob.com", "breezy.hr", "recruitee.com", "teamtailor.com", "avature.net",
+                        "jazzhr.com", "pinpointhq.com", "paycomonline.net", "dayforcehcm.com")
 # Shared hosting / multi-tenant suffixes where the registrable domain is one label deeper.
 _MULTI_TENANT_SUFFIXES = ("co.uk", "com.au", "co.in", "github.io", "herokuapp.com",
                           "azurewebsites.net", "cloudfront.net", "amazonaws.com", "appspot.com")
@@ -166,19 +182,61 @@ def url_block_reason(url: str, allowed_hosts: list[str], trusted_hosts: list[str
     return None
 
 
-def session_allowed_hosts(job: dict) -> list[str]:
-    """Host patterns for one job: its own hosts (employer domain) plus the ATS list."""
-    patterns: list[str] = []
+def _ats_domain(host: str) -> str | None:
+    host = normalize_host(host)
+    for d in ATS_DOMAINS:
+        if host == d or host.endswith("." + d):
+            return d
+    return None
+
+
+def job_hosts(job: dict) -> list[str]:
+    out = []
     for key in ("application_url", "url"):
         host = normalize_host(urlsplit(job.get(key) or "").hostname)
-        if not host or _is_ip_literal(host) or "." not in host:
-            continue
+        if host and not _is_ip_literal(host) and "." in host and host not in out:
+            out.append(host)
+    return out
+
+
+def session_tenant_hosts(job: dict) -> list[str]:
+    """Exact tenant hosts of the job on subdomain-tenant ATSs (see SUBDOMAIN_TENANT_ATS)."""
+    return [h for h in job_hosts(job) if _ats_domain(h) in SUBDOMAIN_TENANT_ATS]
+
+
+def tenant_block_reason(url: str, tenant_hosts: list[str]) -> str | None:
+    """Top-level page on another employer's tenant of a subdomain-tenant ATS -> reason."""
+    try:
+        host = normalize_host(urlsplit(url).hostname)
+    except ValueError:
+        return "unparseable URL"
+    dom = _ats_domain(host)
+    if not dom or dom not in SUBDOMAIN_TENANT_ATS or host in tenant_hosts:
+        return None
+    if not any(_ats_domain(t) == dom for t in tenant_hosts):
+        return f"'{host}' is an ATS tenant unrelated to this job"
+    return f"'{host}' is a different employer's tenant on {dom}"
+
+
+def session_allowed_hosts(job: dict) -> list[str]:
+    """Host patterns for one job: its own hosts (employer domain) plus its own ATS provider family.
+
+    Other ATS providers are not included (audit H2): a job hosted on Greenhouse never needs
+    Workday, so a page cannot steer the browser (or applicant data) to an unrelated tenant."""
+    patterns: list[str] = []
+    ats: set[str] = set()
+    for host in job_hosts(job):
         dom = base_domain(host)
         if dom in _EXACT_HOST_ONLY:
             patterns.append(host)
         else:
             patterns.append("*." + dom)
-    patterns += ["*." + d for d in ATS_DOMAINS]
+        own = _ats_domain(host)
+        if own:
+            fam = next((f for f in ATS_FAMILIES if own in f), (own,))
+            ats.update(fam)
+    patterns += ["*." + d for d in ATS_DOMAINS if d in ats]
+
     seen: list[str] = []
     for p in patterns:
         if p not in seen:
@@ -248,6 +306,8 @@ class SessionPolicy:
     approval_timeout_s: int = 600
     job_url: str = ""  # approvals are bound to this job + this session directory
     asset_hosts: list[str] = field(default_factory=list)  # GET-only static subresource hosts
+    tenant_hosts: list[str] = field(default_factory=list)  # the job's own subdomain-tenant ATS hosts
+
     require_network_guard: bool = True  # hooks deny every tool unless the launcher's guard is verified
 
     @property

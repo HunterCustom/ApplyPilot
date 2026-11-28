@@ -169,16 +169,20 @@ def apply(
         # The grant is single-use and bound to this job, session and exact action.
         from pathlib import Path
 
+        from rich.markup import escape
+
         from applypilot.apply import approval
-        from applypilot.apply.policy import approve_submission
         req = approval.pending_request(Path(approve), nonce or "")
         if req:
-            action = req.get("action") or {}
-            console.print(f"[bold]Approving {req.get('kind')} action[/bold] for job {req.get('job_url')}")
-            for key in ("method", "url", "resource_type", "body_len", "tool_action"):
-                if key in action:
-                    console.print(f"  {key}: {str(action[key])[:200]}")
-        if not nonce or not req or not approve_submission(approve, nonce):
+            # Page-derived text is escaped so it cannot restyle or hide parts of this display (M4).
+            shown = req.get("display") or {}
+            console.print(f"[bold]Approving {escape(str(req.get('kind')))} action[/bold] for job "
+                          f"{escape(str(req.get('job_display') or ''))}")
+            for key in ("method", "url", "resource_type", "body_len", "body_complete", "tool_action", "element"):
+                if key in shown:
+                    console.print(f"  {key}: {escape(str(shown[key])[:200])}")
+        if not nonce or not req or not approval.grant(Path(approve), nonce, expected_digest=req.get("digest")):
+
             console.print("[red]No matching pending (unexpired, unused) submission request.[/red]")
             raise typer.Exit(code=1)
         console.print("[green]Approved for this one request only.[/green]")

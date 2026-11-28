@@ -27,6 +27,8 @@ tool) and kills the agent through ``on_failure``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -35,13 +37,14 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from applypilot.apply import approval
 from applypilot.apply import network_policy as NP
 from applypilot.apply import policy as P
 from applypilot.apply.cdp import CDPConnection, CDPError, browser_ws_url
 from applypilot.apply.egress_proxy import EgressProxy
+from applypilot.apply.redact import safe_url
 
 logger = logging.getLogger(__name__)
 NETWORK_LOG = "network.jsonl"
@@ -54,18 +57,34 @@ _WORKER_TARGETS = ("worker", "shared_worker", "service_worker")
 _ALLOWED_NAV_SCHEMES = ("http", "https", "about", "data", "blob", "chrome-error")
 _NEW_TAB_URLS = ("chrome://newtab", "chrome://new-tab-page", "chrome-search://")  # browser-owned blank tab
 
+# Installed in every document before its scripts run (defence in depth, audit H4/M2): never hand a
+# link to the operating system, and remove transports the Fetch layer cannot hold. The launcher's
+# enforcement does not depend on this script (a page may find a way around it); the process jail
+# (proc_jail) and this guard remain the boundaries.
+PAGE_GUARD_SCRIPT = r"""
+(() => {
+  const ok = (u) => { try { const s = new URL(u, document.baseURI).protocol;
+    return ["http:", "https:", "about:", "blob:", "data:", "javascript:"].includes(s); } catch (e) { return false; } };
+  const stop = (ev) => { const a = ev.target && ev.target.closest && ev.target.closest("a[href],area[href]");
+    if (a && !ok(a.getAttribute("href"))) { ev.preventDefault(); ev.stopImmediatePropagation(); } };
+  for (const t of ["click", "auxclick", "keydown"]) window.addEventListener(t, stop, true);
+  const open = window.open;
+  window.open = function (u, ...r) { if (u !== undefined && u !== "" && !ok(String(u))) return null;
+    return open.call(window, u, ...r); };
+  for (const k of ["WebSocket", "WebTransport", "RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel"]) {
+    try { Object.defineProperty(window, k, {value: undefined, configurable: false, writable: false}); } catch (e) {}
+  }
+})();
+"""
+
 
 class NetworkGuardError(RuntimeError):
     pass
 
 
 def _strip(url: str) -> str:
-    """URL without query/fragment for logs (queries can carry personal data)."""
-    try:
-        p = urlsplit(url)
-        return urlunsplit((p.scheme, p.netloc, p.path, "", ""))[:200]
-    except ValueError:
-        return "(unparseable)"
+    """URL safe for logs: no userinfo, query or fragment; token-like path segments masked."""
+    return safe_url(url)
 
 
 def _nofrag(url: str) -> str:
@@ -78,8 +97,8 @@ class BrowserController:
         self.conn = CDPConnection()
         self.sessions: dict[str, dict] = {}       # sessionId -> targetInfo
         self.intercepted: set[str] = set()        # sessions with Fetch interception enabled
-        self.form_navs: dict[str, tuple[float, str]] = {}  # url(no fragment) -> (t, reason)
-        self.paused_urls: list[str] = []
+        self.form_navs: dict[tuple[str, str], tuple[float, str]] = {}  # (frameId, url) -> (t, reason)
+        self.paused_urls: list[str] = []          # recorded only during the self-test
         self.selftest_urls: set[str] = set()
 
     # --- lifecycle ---------------------------------------------------------------
@@ -106,8 +125,10 @@ class BrowserController:
             if method == "Target.attachedToTarget":
                 await self._on_attached(params, sid)
             elif method == "Target.detachedFromTarget":
-                self.sessions.pop(params.get("sessionId", ""), None)
+                info = self.sessions.pop(params.get("sessionId", ""), None)
                 self.intercepted.discard(params.get("sessionId", ""))
+                if info:
+                    await self._check_detach(info)
             elif method == "Fetch.requestPaused":
                 await self._on_paused(params, sid)
             elif method == "Page.frameRequestedNavigation":
@@ -140,6 +161,8 @@ class BrowserController:
                 self.intercepted.add(sid)
             if ttype in _DOC_TARGETS:
                 await self.conn.send("Page.enable", {}, sid)
+                await self.conn.send("Page.addScriptToEvaluateOnNewDocument",
+                                     {"source": PAGE_GUARD_SCRIPT, "runImmediately": True}, sid)
                 await self.conn.send("Network.enable", {}, sid)
                 await self.conn.send("Target.setAutoAttach", _ATTACH, sid)
             elif ttype in _WORKER_TARGETS and params.get("waitingForDebugger"):
@@ -156,13 +179,18 @@ class BrowserController:
                 await self.conn.send("Network.enable", {}, sid)
                 await self.conn.send("Target.setAutoAttach", _ATTACH, sid)
         except CDPError as e:
+            # A target destroyed while we attached ("Session ... not found") can no longer run.
+            if "not found" in str(e).lower() and not await self._target_exists(info.get("targetId", "")):
+                self.guard.log({"layer": "cdp", "kind": "attach", "target": ttype, "decision": "gone"})
+                return
             # Interception could not be established: the target must never run.
             self.guard.log({"layer": "cdp", "kind": "attach", "target": ttype, "decision": "intercept_failed",
                             "reason": str(e)[:120]})
-            try:
-                await self.conn.send("Target.closeTarget", {"targetId": info.get("targetId", "")})
-            except CDPError:
-                pass
+            if ttype != "iframe":  # closing an iframe target id would close its whole page
+                try:
+                    await self.conn.send("Target.closeTarget", {"targetId": info.get("targetId", "")})
+                except CDPError:
+                    pass
             if ttype in _DOC_TARGETS + _WORKER_TARGETS:
                 self.guard.fail(f"could not intercept requests of a new {ttype or 'unknown'} target")
             return
@@ -170,22 +198,46 @@ class BrowserController:
         if params.get("waitingForDebugger"):
             await self.conn.send("Runtime.runIfWaitingForDebugger", {}, sid)
 
+    async def _target_exists(self, tid: str) -> bool:
+        """True unless Chrome confirms the target is gone (an unanswerable query counts as alive)."""
+        try:
+            targets = (await self.conn.send("Target.getTargets", {}, timeout=5)).get("targetInfos", [])
+        except CDPError:
+            return True
+        return any(t.get("targetId") == tid for t in targets)
+
+    async def _check_detach(self, info: dict) -> None:
+        """A target that detached but still exists runs without interception: enforcement lost."""
+        tid = info.get("targetId", "")
+        for _ in range(4):  # destruction can trail the detach notification briefly
+            try:
+                targets = (await self.conn.send("Target.getTargets", {}, timeout=5)).get("targetInfos", [])
+            except CDPError:
+                if self.conn.on_close is None:
+                    return  # deliberate shutdown
+                self.guard.fail("could not confirm a detached target was destroyed")
+                return
+            if not any(t.get("targetId") == tid for t in targets):
+                return
+            await asyncio.sleep(0.25)
+        self.guard.fail(f"a live {info.get('type') or 'unknown'} target detached from interception")
+
     def _on_frame_nav(self, params: dict) -> None:
         url, reason = params.get("url", ""), params.get("reason", "")
         now = time.monotonic()
-        self.form_navs = {u: v for u, v in self.form_navs.items() if now - v[0] < FORM_NAV_TTL_S}
-        self.form_navs[_nofrag(url)] = (now, reason)
+        self.form_navs = {k: v for k, v in self.form_navs.items() if now - v[0] < FORM_NAV_TTL_S}
+        self.form_navs[(params.get("frameId", ""), _nofrag(url))] = (now, reason)
         scheme = urlsplit(url).scheme.lower()
         if scheme in ("mailto", "tel", "sms") or (scheme and scheme not in _ALLOWED_NAV_SCHEMES + ("javascript",)):
             # External handlers are disabled in the worker profile; an email application needs a human.
             self.guard.violation(f"page requested a '{scheme}:' navigation (external application / email)",
                                  terminal=True)
 
-    async def _form_reason(self, url: str) -> str | None:
-        key = _nofrag(url)
+    async def _form_reason(self, url: str, frame_id: str) -> str | None:
+        key = (frame_id, _nofrag(url))
         deadline = time.monotonic() + FORM_NAV_WAIT_S
         while True:
-            hit = self.form_navs.get(key)
+            hit = self.form_navs.pop(key, None)  # consumed: one signal decides one request
             if hit:
                 return hit[1]
             if time.monotonic() >= deadline:
@@ -199,50 +251,87 @@ class BrowserController:
         rtype = params.get("resourceType", "Other")
         info = self.sessions.get(sid or "", {})
         is_main = info.get("type") == "page" and params.get("frameId") == info.get("targetId")
-        self.paused_urls.append(url)
-        if url in self.selftest_urls:
-            await self._continue(rid, sid)
-            return
+        if self.selftest_urls:
+            self.paused_urls.append(url)
+            if url in self.selftest_urls:
+                await self._continue(rid, sid)
+                return
         form = None
         if rtype == "Document" and method.upper() == "GET":
-            form = await self._form_reason(url)
+            form = await self._form_reason(url, params.get("frameId", ""))
         decision = NP.decide_request(self.guard.policy_or_deny(), url=url, method=method, resource_type=rtype,
-                                     is_main_frame=is_main, form_submission=bool(form and form.startswith("formSubmission")))
+                                     is_main_frame=is_main,
+                                     form_submission=bool(form and form.startswith("formSubmission")),
+                                     headers=req.get("headers") or {}, has_body=bool(req.get("hasPostData")),
+                                     sensitive_tokens=self.guard.sensitive_tokens)
         self.guard.log({"layer": "cdp", "kind": "request", "method": method, "type": rtype, "url": _strip(url),
                         "main": is_main, "decision": decision.action, "reason": decision.reason[:160]})
         if decision.action == "allow":
             await self._continue(rid, sid)
         elif decision.action == "approve":
-            asyncio.get_running_loop().create_task(self._await_approval(rid, sid, params, decision.reason))
+            # Close the proxy write gate in this same loop step: if CDP is lost while the request
+            # waits, Chrome releases it, but its bytes stop at the gate and the tunnel is revoked.
+            self.guard.proxy.hold()
+            task = asyncio.get_running_loop().create_task(self._await_approval(rid, sid, params, decision.reason))
+            task.add_done_callback(self._approval_done)
         else:
-            await self._fail(rid, sid)
+            if not await self._fail(rid, sid) and method.upper() not in NP.SAFE_METHODS:
+                self.guard.fail("a blocked state-changing request could not be confirmed as failed")
             if decision.boundary:
                 self.guard.dry_run_boundary(method, rtype, url, decision.reason)
             elif decision.terminal:
                 self.guard.violation(f"blocked request: {decision.reason}", terminal=True)
 
-    async def _await_approval(self, rid: str, sid: str | None, params: dict, reason: str) -> None:
-        req = params.get("request", {})
-        body = "".join(e.get("bytes", "") for e in req.get("postDataEntries") or []) or req.get("postData") or ""
-        action = {"method": req.get("method"), "url": req.get("url"), "resource_type": params.get("resourceType"),
-                  "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "body_len": len(body)}
-        ok = await self.guard.request_approval(action, reason)
-        if ok:
-            await self._continue(rid, sid)
-        else:
-            await self._fail(rid, sid)
+    def _approval_done(self, task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self.guard.fail(f"approval handling error: {type(task.exception()).__name__}")
 
-    async def _continue(self, rid: str, sid: str | None) -> None:
+    async def _await_approval(self, rid: str, sid: str | None, params: dict, reason: str) -> None:
+        """Hold one state-changing request for a human. The proxy write gate is held on entry."""
+        released = False
+        try:
+            req = params.get("request", {})
+            body, complete = request_body(req)
+            info = self.sessions.get(sid or "", {})
+            action = {"method": req.get("method"), "url": req.get("url"), "resource_type": params.get("resourceType"),
+                      "request_id": rid, "target_id": info.get("targetId", ""), "frame_id": params.get("frameId", ""),
+                      "header_names": sorted({str(k).lower() for k in (req.get("headers") or {})}),
+                      "body_sha256": hashlib.sha256(body).hexdigest(), "body_len": len(body),
+                      "body_complete": complete}
+            if not complete:
+                # Chrome did not expose every byte (e.g. multipart file parts): an exact approval of
+                # this payload is impossible, so it is refused and left for manual handling.
+                self.guard.violation("state-changing request body could not be fully inspected; manual "
+                                     "application required", terminal=False)
+                await self._fail(rid, sid)
+                return
+            ok = await self.guard.request_approval(action, reason)
+            if ok and not self.guard.failed.is_set() and sid in self.sessions:
+                self.guard.proxy.release()
+                released = True
+                ok_sent = await self._continue(rid, sid)
+                self.guard.record_release(action, "released" if ok_sent else "release_unconfirmed")
+            else:
+                await self._fail(rid, sid)
+        finally:
+            if not released:
+                self.guard.proxy.release()
+
+    async def _continue(self, rid: str, sid: str | None) -> bool:
         try:
             await self.conn.send("Fetch.continueRequest", {"requestId": rid}, sid)
+            return True
         except CDPError:
-            pass  # request already gone (tab closed / navigation cancelled)
+            return False  # request already gone (tab closed / navigation cancelled) or unknown
 
-    async def _fail(self, rid: str, sid: str | None) -> None:
+    async def _fail(self, rid: str, sid: str | None) -> bool:
+        """True when Chrome confirmed the failure or the request no longer exists."""
         try:
             await self.conn.send("Fetch.failRequest", {"requestId": rid, "errorReason": "BlockedByClient"}, sid)
-        except CDPError:
-            pass
+            return True
+        except CDPError as e:
+            # "Invalid InterceptionId": the request is already gone (tab closed), nothing was sent.
+            return "interception" in str(e).lower() and not self.guard.failed.is_set()
 
     # --- self-test -----------------------------------------------------------------
     async def selftest(self, proxy: EgressProxy) -> str | None:
@@ -296,6 +385,8 @@ class NetworkGuard:
         self.failed = threading.Event()
         self.failure_reason = ""
         self.on_failure: Callable[[], None] | None = None
+        self.kill_browser: Callable[[], None] | None = None  # set by the worker: stop Chrome now
+        self.sensitive_tokens: list[str] = []  # in memory only: applicant values that must not leave in URLs
         self.on_approval_request: Callable[[dict], None] | None = None
         self._lock = threading.Lock()
         self.proxy = EgressProxy(get_policy=lambda: None if self.failed.is_set() else self.policy,
@@ -338,15 +429,30 @@ class NetworkGuard:
             return
         self.failure_reason = reason
         self.failed.set()
+        # Containment first, independent of CDP: cut every tunnel, then stop the browser and agent.
+        if threading.current_thread() is self._thread:
+            self.proxy.revoke()
+        else:
+            self.loop.call_soon_threadsafe(self.proxy.revoke)
         if self.policy is not None:
             (self.policy.dir / P.GUARD_FAILED_FILE).write_text(reason, encoding="utf-8")
             self.violation(f"network guard failure: {reason}", terminal=True)
-        cb = self.on_failure
-        if cb:
-            try:
-                cb()
-            except Exception:
-                logger.exception("network guard on_failure callback failed")
+        for cb in (self.kill_browser, self.on_failure):
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("network guard failure callback failed")
+
+    def record_release(self, action: dict, outcome: str) -> None:
+        """Launcher-side evidence that a human-approved write was handed back to Chrome."""
+        pol = self.policy
+        if pol is None:
+            return
+        P.record_audit(pol, {"phase": "network", "net_release": outcome, "t": time.time(),
+                             "request_id": action.get("request_id"), "target_id": action.get("target_id"),
+                             "frame_id": action.get("frame_id"), "method": action.get("method"),
+                             "host": P.normalize_host(urlsplit(action.get("url") or "").hostname)})
 
     async def request_approval(self, action: dict, reason: str) -> bool:
         pol = self.policy
@@ -363,7 +469,7 @@ class NetworkGuard:
             while time.time() <= req["expires"] and not self.failed.is_set():
                 if approval.consume(pol.dir, req["nonce"], job_url=req["job_url"], digest=req["digest"]):
                     P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True,
-                                         "nonce": req["nonce"]})
+                                         "nonce": req["nonce"], "t": time.time()})
                     return True
                 await asyncio.sleep(0.5)
         finally:
@@ -394,9 +500,20 @@ class NetworkGuard:
         status.write_text(json.dumps({"active": True, "selftest": "ok", "proxy_port": self.proxy_port,
                                       "t": time.time()}), encoding="utf-8")
 
+    def seal(self) -> None:
+        """End of the agent session: cut all egress for good before the outcome is recorded."""
+        try:
+            self._run(self._seal(), 5)
+        except Exception:
+            logger.debug("network guard seal error", exc_info=True)
+
+    async def _seal(self) -> None:
+        self.proxy.revoke()
+
     def stop(self) -> None:
         try:
             if self.controller is not None:
+
                 self._run(self.controller.stop(), 5)
             self._run(self.proxy.stop(), 5)
         except Exception:
@@ -407,7 +524,26 @@ class NetworkGuard:
             self._thread.join(timeout=5)
 
 
+def request_body(req: dict) -> tuple[bytes, bool]:
+    """(decoded request body, complete?). Incomplete when Chrome omitted any part of it."""
+    entries = req.get("postDataEntries")
+    if entries:
+        out = b""
+        for e in entries:
+            if "bytes" not in e:
+                return out, False  # e.g. a file element Chrome does not expose
+            try:
+                out += base64.b64decode(e["bytes"], validate=True)
+            except (binascii.Error, ValueError):
+                return out, False
+        return out, True
+    if req.get("postData") is not None:
+        return str(req["postData"]).encode("utf-8"), True
+    return b"", not req.get("hasPostData")
+
+
 def chrome_network_args(proxy_port: int) -> list[str]:
+
     """Chrome flags that make the egress proxy the browser's only network route."""
     return [
         f"--proxy-server=http://127.0.0.1:{proxy_port}",

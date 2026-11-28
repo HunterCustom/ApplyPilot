@@ -27,7 +27,8 @@ from rich.live import Live
 from applypilot import config, eligibility
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, dry_run_guard, prompt as prompt_mod
-from applypilot.apply import network_policy, policy as policy_mod, verification_mcp
+from applypilot.apply import approval, network_policy, policy as policy_mod, verification_mcp
+from applypilot.apply import policy_hook as policy_hook_mod
 from applypilot.apply.network_guard import NetworkGuard, NetworkGuardError
 from applypilot.apply.redact import Redactor
 from applypilot.apply.chrome import (
@@ -85,7 +86,14 @@ PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.86"
 
 
 def verification_enabled() -> bool:
-    """The verification-code helper is offered only when readonly credentials are configured."""
+    """The verification-code helper is offered only on explicit opt-in AND with readonly credentials.
+
+    Off by default (audit L1): it cannot yet bind a message to this application/session, so a
+    concurrent session could receive an unrelated code. Opt in with APPLYPILOT_ENABLE_VERIFY_HELPER=1
+    for a supervised single-worker run only. A credential-path override (APPLYPILOT_GMAIL_CREDENTIALS)
+    is refused because the helper process never receives it."""
+    if os.environ.get("APPLYPILOT_ENABLE_VERIFY_HELPER") != "1" or os.environ.get("APPLYPILOT_GMAIL_CREDENTIALS"):
+        return False
     return verification_mcp.credentials_path().exists()
 
 
@@ -157,8 +165,7 @@ _ELIGIBLE_CLAUSE = (
 _NO_DUPLICATE_CLAUSE = f"""NOT EXISTS (
         SELECT 1 FROM jobs AS o
         WHERE o.url != j.url
-          AND o.application_url IS NOT NULL
-          AND o.application_url = j.application_url
+          AND COALESCE(o.application_url, o.url) = COALESCE(j.application_url, j.url)
           AND o.apply_status IN ({",".join(repr(s) for s in DUPLICATE_BLOCKING_STATUSES)})
     )"""
 
@@ -168,20 +175,22 @@ def _like_escape(value: str) -> str:
 
 
 def _select_target(conn, target_url: str):
-    """Find an explicitly requested job. Exact URL matches win over substring matches."""
-    like = f"%{_like_escape(target_url.split('?')[0].rstrip('/'))}%"
-    return conn.execute(f"""
+    """Find an explicitly requested job by its exact job URL (audit M6: never a fuzzy match).
+
+    The target must resolve to exactly one row; an application URL shared by several rows is
+    ambiguous and refused. The attempt cap applies as in queue mode."""
+    rows = conn.execute(f"""
         SELECT {_JOB_COLUMNS}
         FROM jobs AS j
-        WHERE (j.url = ? OR j.application_url = ?
-               OR j.application_url LIKE ? ESCAPE '\\' OR j.url LIKE ? ESCAPE '\\')
+        WHERE (j.url = ? OR (j.application_url = ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE url = ?)))
           AND j.tailored_resume_path IS NOT NULL
           AND (j.apply_status IS NULL OR j.apply_status IN ('failed', 'dry_run'))
+          AND (j.apply_attempts IS NULL OR j.apply_attempts < ?)
           AND {_ELIGIBLE_CLAUSE}
           AND {_NO_DUPLICATE_CLAUSE}
-        ORDER BY (j.url = ? OR j.application_url = ?) DESC, j.url
-        LIMIT 1
-    """, (target_url, target_url, like, like, target_url, target_url)).fetchone()
+        LIMIT 2
+    """, (target_url, target_url, target_url, config.DEFAULTS["max_apply_attempts"])).fetchall()
+    return rows[0] if len(rows) == 1 else None
 
 
 def _select_next(conn, min_score: int, dry_run: bool):
@@ -586,7 +595,9 @@ def classify_session(final_text: str | None, *, final_is_error: bool, dry_run: b
                      watchdog_fired: bool = False, interrupted: bool = False,
                      security_failure: str | None = None, tool_uses: int = 0,
                      audit_result: str | None = None,
-                     submit_approved: bool = False, confirmation_seen: bool = False) -> str:
+                     submit_approved: bool = False, confirmation_seen: bool = False,
+                     released_writes: int = 0, ambiguous_writes: int = 0,
+                     evidence_correlated: bool | None = None) -> str:
     """Combine the agent's final reply with launcher observations into one result.
 
     The agent's own claim is never enough on its own:
@@ -602,7 +613,14 @@ def classify_session(final_text: str | None, *, final_is_error: bool, dry_run: b
       a submission may have happened -> uncertain (human review);
     - in a dry run, a submit-like action the guard did not block, or an agent
       claiming APPLIED, means a real submission may have happened -> uncertain.
+    - any human-approved write the network guard released (or may have released) makes
+      every non-APPLIED outcome uncertain: data reached the employer, so the job is never
+      retried automatically (audit H3). APPLIED additionally needs causal evidence
+      (approved submit -> released write -> later confirmation).
     """
+    if evidence_correlated is None:
+        evidence_correlated = submit_approved and confirmation_seen
+    wrote = released_writes + ambiguous_writes
     if security_failure:
         if tool_uses:
             return "uncertain:security_config_unverified"
@@ -617,13 +635,18 @@ def classify_session(final_text: str | None, *, final_is_error: bool, dry_run: b
     elif final_is_error and not result.startswith("uncertain:"):
         result = f"uncertain:agent_error_after_{result.replace(':', '_')}"
     if dry_run:
+        if wrote:
+            return "uncertain:dry_run_write_released"
         if unblocked_submits:
             return "uncertain:dry_run_submit_not_blocked"
         if result == "applied":
             return "uncertain:applied_claimed_in_dry_run"
         return result
-    if result == "applied" and not (submit_attempts and submit_approved and confirmation_seen):
+    if result == "applied" and not (submit_approved and evidence_correlated and released_writes
+                                    and not ambiguous_writes):
         return "uncertain:applied_without_evidence"
+    if wrote and result != "applied" and not result.startswith("uncertain:"):
+        return f"uncertain:after_released_write:{result}"
     if submit_attempts and result != "applied" and not result.startswith("uncertain:"):
         return f"uncertain:after_submit_action:{result}"
     return result
@@ -637,7 +660,8 @@ def is_submit_action(tool_name: str, tool_input: dict) -> bool:
     if name in {"browser_click", "browser_double_click"}:
         label = " ".join(str((tool_input or {}).get(k, "")) for k in ("element", "text", "name"))
         return bool(dry_run_guard.SUBMIT_WORDS.search(label))
-    return False
+    # Same rules as the hook: Enter and type-with-submit can commit a form too.
+    return policy_hook_mod._is_submit_like(tool_name or "", tool_input or {}) is not None
 
 
 EXPECTED_MCP_SERVERS = {"playwright", "applypilot_verify"}
@@ -735,8 +759,11 @@ def verify_init_event(msg: dict, verify_enabled: bool) -> str | None:
     return None
 
 
-def audit_session(session_dir: Path, tool_uses: int) -> str | None:
-    """Post-session audit of the hook records. Returns an uncertain:* result or None."""
+def audit_session(session_dir: Path, tool_uses: int, tool_use_ids: set[str] | None = None) -> str | None:
+    """Post-session audit of the hook records. Returns an uncertain:* result or None.
+
+    With ``tool_use_ids`` every streamed tool call must have its own PreToolUse decision
+    (matched by id, not merely counted -- audit M3)."""
     audit = policy_mod.read_jsonl(session_dir / "audit.jsonl")
     violations = policy_mod.read_jsonl(session_dir / "violations.jsonl")
     pre = sum(1 for r in audit if r.get("phase") == "pre")
@@ -744,6 +771,10 @@ def audit_session(session_dir: Path, tool_uses: int) -> str | None:
         return "uncertain:policy_hook_not_active"
     if pre < tool_uses:
         return "uncertain:policy_hook_not_enforced"
+    if tool_use_ids:
+        decided = {r.get("id") for r in audit if r.get("phase") == "pre"}
+        if tool_use_ids - decided:
+            return "uncertain:policy_hook_not_enforced"
     if (session_dir / policy_mod.GUARD_FAILED_FILE).exists():
         return "uncertain:network_guard_failed"
     if tool_uses and not _guard_verified(session_dir):
@@ -761,16 +792,22 @@ def _guard_verified(session_dir: Path) -> bool:
     return isinstance(status, dict) and status.get("active") is True and status.get("selftest") == "ok"
 
 
-def submission_evidence(session_dir: Path) -> tuple[bool, bool]:
-    """(a human approved the submit click AND the request it sent, confirmation text was seen).
+def submission_evidence(session_dir: Path) -> dict:
+    """Causal submission evidence from launcher-owned records (audit H3).
 
-    The click approval comes from the policy hook, the request approval from the
-    launcher's network guard: a submission the guard never released cannot count."""
+    ``released``: human-approved state-changing requests the network guard actually handed
+    back to Chrome; ``ambiguous``: approved requests whose release could not be confirmed.
+    ``correlated``: a human-approved submit action, then a released write, then confirmation
+    text observed *after* that release, in that order. Anything less is not proof of applying.
+    """
     audit = policy_mod.read_jsonl(session_dir / "audit.jsonl")
-    approved = (any(r.get("submit_approved") for r in audit)
-                and any(r.get("net_approved") for r in audit))
-    confirmed = any(r.get("evidence") == "confirmation_text" for r in audit)
-    return approved, confirmed
+    clicks = sorted(float(r.get("t", 0)) for r in audit if r.get("submit_approved"))
+    releases = sorted(float(r.get("t", 0)) for r in audit if r.get("net_release") == "released")
+    ambiguous = sum(1 for r in audit if r.get("net_release") == "release_unconfirmed")
+    confirms = sorted(float(r.get("t", 0)) for r in audit if r.get("evidence") == "confirmation_text")
+    correlated = any(c <= rel and any(x > rel for x in confirms) for rel in releases for c in clicks)
+    return {"released": len(releases), "ambiguous": ambiguous, "correlated": correlated,
+            "approved": bool(clicks) and bool(releases), "confirmed": bool(confirms)}
 
 
 _SECRET_ENV_RE = re.compile(r"(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.IGNORECASE)
@@ -788,6 +825,10 @@ def agent_env() -> dict:
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     env.pop("APPLYPILOT_GMAIL_CREDENTIALS", None)
+    for k in list(env):
+        # Playwright MCP reads these to widen file access / output roots / config (audit M3).
+        if k.upper().startswith(("PLAYWRIGHT_MCP_", "PLAYWRIGHT_BROWSERS_PATH", "NODE_OPTIONS", "PWDEBUG")):
+            env.pop(k, None)
     return env
 
 
@@ -808,8 +849,22 @@ def build_session_policy(job: dict, session: Path, dry_run: bool,
         verify_enabled=verify_enabled, verify_sender_domains=sender_domains,
         require_submit_approval=not dry_run,
         job_url=job["url"], asset_hosts=list(network_policy.STATIC_ASSET_HOSTS),
-        require_network_guard=True,
+        require_network_guard=True, tenant_hosts=policy_mod.session_tenant_hosts(job),
     )
+
+
+def sensitive_url_tokens(profile: dict) -> list[str]:
+    """Applicant values that must never leave the browser inside a URL (kept in memory only)."""
+    personal = (profile or {}).get("personal", {}) or {}
+    out: list[str] = []
+    for key in ("email", "phone", "full_name", "address"):
+        v = str(personal.get(key) or "").strip()
+        if key == "phone":
+            v = re.sub(r"\D", "", v)
+        if len(v) >= 4:
+            out.append(v)
+    return out
+
 
 
 def run_job(job: dict, port: int, worker_id: int = 0,
@@ -859,7 +914,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     cmd = build_agent_command(model, mcp_config_path, dry_run, settings_path, verify_enabled)
 
     env = agent_env()
-    redact = Redactor(config.load_profile(), secrets_file=session / "secrets.txt")
+    profile = config.load_profile()
+    redact = Redactor(profile, secrets_file=session / "secrets.txt")
+    guard.sensitive_tokens = sensitive_url_tokens(profile)
 
     worker_dir = reset_worker_dir(worker_id)
 
@@ -929,6 +986,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         final_text: str | None = None  # structured final reply from the "result" event
         final_is_error = False
         submit_ids: set[str] = set()  # tool_use ids of submit-like actions
+        tool_use_ids: set[str] = set()
+        init_seen = False
         guard_blocked_ids: set[str] = set()  # ids the dry-run guard refused
         tool_uses = 0
         security_failure: str | None = None
@@ -945,6 +1004,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     msg = json.loads(line)
                     msg_type = msg.get("type")
                     if msg_type == "system" and msg.get("subtype") == "init":
+                        init_seen = True
                         security_failure = verify_init_event(msg, verify_enabled)
                         if security_failure:
                             lf.write(f"  !! security configuration not enforced: {security_failure}\n")
@@ -958,6 +1018,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 lf.write(redact(block["text"]) + "\n")
                             elif bt == "tool_use":
                                 tool_uses += 1
+                                tool_use_ids.add(str(block.get("id", f"anon-{tool_uses}")))
+                                if not init_seen:
+                                    # The tool surface must be verified before the agent acts.
+                                    security_failure = "tool use before the init event"
+                                    lf.write("  !! tool use before the init event; stopping session\n")
+                                    _kill_process_tree(proc.pid)
+                                    break
                                 if tool_uses == 1 and not (session / "hook_alive").exists():
                                     # SessionStart runs before the first turn; no canary = no policy.
                                     security_failure = "policy hooks are not active"
@@ -1001,7 +1068,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         }
                         final_text = msg.get("result") or ""
                         final_is_error = bool(msg.get("is_error"))
-                        text_parts.append(final_text)
+                        text_parts.append(final_text or "")
                     elif msg_type == "user":
                         for block in msg.get("message", {}).get("content", []):
                             if (isinstance(block, dict) and block.get("type") == "tool_result"
@@ -1014,6 +1081,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.wait(timeout=config.DEFAULTS["apply_timeout"])
         returncode = proc.returncode
         proc = None
+        # Quiesce before reading evidence (audit H3): no byte leaves the browser from here on,
+        # so the outcome is decided on a final record.
+        guard.seal()
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
@@ -1030,7 +1100,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
 
-        approved, confirmed = submission_evidence(session)
+        ev = submission_evidence(session)
         result = classify_session(
             final_text, final_is_error=final_is_error, dry_run=dry_run,
             submit_attempts=len(submit_ids),
@@ -1038,8 +1108,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             watchdog_fired=watchdog_fired.is_set(),
             interrupted=bool(returncode and returncode < 0),
             security_failure=security_failure, tool_uses=tool_uses,
-            audit_result=audit_session(session, tool_uses),
-            submit_approved=approved, confirmation_seen=confirmed,
+            audit_result=audit_session(session, tool_uses, tool_use_ids),
+            submit_approved=ev["approved"], confirmation_seen=ev["confirmed"],
+            released_writes=ev["released"], ambiguous_writes=ev["ambiguous"],
+            evidence_correlated=ev["correlated"],
         )
 
         label, _, detail = result.partition(":")
@@ -1063,6 +1135,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         return f"uncertain:error:{str(e)[:80]}", duration_ms
     finally:
         (session / "secrets.txt").unlink(missing_ok=True)
+        approval.cancel_all(session)  # no grant may outlive its session (audit M4)
         if watchdog is not None:
             watchdog.cancel()
         with _claude_lock:
@@ -1178,7 +1251,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             guard = NetworkGuard()
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
-                                        proxy_port=guard.proxy_port)
+                                        proxy_port=guard.proxy_port,
+                                        on_escape=lambda why, g=guard: g.fail(why))
+            guard.kill_browser = lambda p=chrome_proc: _kill_process_tree(p.pid)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run, guard=guard)
@@ -1277,9 +1352,12 @@ def main(limit: int = 1, target_url: str | None = None,
                       "disabled and a guard hook blocks submit-like actions. This is best-effort, "
                       "not a guarantee: supervise every dry run.[/bold yellow]")
 
+    if target_url:
+        workers = 1  # one exact target is never worked on by two workers (audit M6)
     if continuous:
         effective_limit = 0
         mode_label = "continuous"
+
     else:
         effective_limit = limit
         mode_label = f"{limit} jobs"
@@ -1344,12 +1422,16 @@ def main(limit: int = 1, target_url: str | None = None,
             else:
                 # Multi-worker — distribute limit across workers
                 if effective_limit:
+                    # Never start a worker with a zero quota: worker_loop reads 0 as
+                    # "continuous", so a small batch could keep claiming jobs (audit M6).
+                    workers = min(workers, effective_limit)
                     base = effective_limit // workers
                     extra = effective_limit % workers
                     limits = [base + (1 if i < extra else 0)
                               for i in range(workers)]
                 else:
                     limits = [0] * workers  # continuous mode
+
 
                 with ThreadPoolExecutor(max_workers=workers,
                                         thread_name_prefix="apply-worker") as executor:

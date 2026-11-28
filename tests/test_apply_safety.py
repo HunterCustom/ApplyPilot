@@ -157,7 +157,8 @@ class SessionClassificationTests(unittest.TestCase):
         self.assertEqual(self.classify("RESULT:FAILED:page_error", submit_attempts=1),
                          "uncertain:after_submit_action:failed:page_error")
         self.assertEqual(self.classify("RESULT:APPLIED", submit_attempts=1, submit_approved=True,
-                                       confirmation_seen=True), "applied")
+                                       confirmation_seen=True, released_writes=1,
+                                       evidence_correlated=True), "applied")
         self.assertEqual(self.classify("RESULT:FAILED:page_error"), "failed:page_error")
 
     def test_watchdog_and_agent_error_are_uncertain(self):

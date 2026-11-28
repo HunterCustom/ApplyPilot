@@ -68,12 +68,17 @@ def decide_pre(policy: P.SessionPolicy, tool_name: str, tool_input: dict) -> tup
         return False, f"tool '{tool_name}' is not permitted", True
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     name = _short(tool_name)
+    bad_args = [k for k in P.FORBIDDEN_TOOL_ARGS if k in tool_input]
+    if bad_args:
+        return False, f"argument(s) {bad_args} are not permitted (no file output)", True
 
     for key in ("url",):
         if key in tool_input:
-            why = P.url_block_reason(tool_input[key], policy.allowed_hosts, policy.trusted_hosts)
+            why = (P.url_block_reason(tool_input[key], policy.allowed_hosts, policy.trusted_hosts)
+                   or P.tenant_block_reason(str(tool_input[key]), policy.tenant_hosts))
             if why:
                 return False, f"navigation blocked: {why}", True
+
     if name == "browser_tabs" and str(tool_input.get("action", "")).lower() == "new" and tool_input.get("url"):
         why = P.url_block_reason(tool_input["url"], policy.allowed_hosts, policy.trusted_hosts)
         if why:
@@ -171,9 +176,13 @@ def handle_post(policy: P.SessionPolicy, event: dict) -> int:
                           "reason": f"{POLICY_PREFIX}: {bad}. Stop now and output RESULT:FAILED:policy_violation"}))
         return 0
     if not policy.dry_run and CONFIRMATION_RE.search(text):
-        approved = any(r.get("submit_approved") for r in P.read_jsonl(policy.dir / "audit.jsonl"))
-        if approved:
-            P.record_audit(policy, {"phase": "post", "tool": tool, "evidence": "confirmation_text"})
+        # Only after the launcher released a human-approved write (audit H3); the launcher still
+        # checks the order (approved submit -> release -> this confirmation) before trusting it.
+        released = any(r.get("net_release") == "released" for r in P.read_jsonl(policy.dir / "audit.jsonl"))
+        if released:
+            P.record_audit(policy, {"phase": "post", "tool": tool, "evidence": "confirmation_text",
+                                    "id": event.get("tool_use_id")})
+
     P.record_audit(policy, {"phase": "post", "tool": tool, "decision": "ok"})
     return 0
 

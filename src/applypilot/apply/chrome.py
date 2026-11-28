@@ -25,6 +25,8 @@ BASE_CDP_PORT = 9222
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
+_jails: dict[int, object] = {}  # worker_id -> proc_jail.ProcessJail
+
 _chrome_lock = threading.Lock()
 
 
@@ -261,11 +263,15 @@ def chrome_command(chrome_exe: str, port: int, profile_dir: Path, headless: bool
         cmd += chrome_network_args(proxy_port)
     if headless:
         cmd.append("--headless=new")
+    # Start on about:blank, never the New Tab Page: its browser-owned chrome-untrusted:// frames
+    # come and go during start-up and only add targets the guard must race to intercept.
+    cmd.append("about:blank")
     return cmd
 
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False, proxy_port: int | None = None) -> subprocess.Popen:
+                  headless: bool = False, proxy_port: int | None = None,
+                  on_escape=None) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
@@ -274,6 +280,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
         headless: Run Chrome in headless mode (no visible window).
         proxy_port: The launcher's egress proxy (``NetworkGuard.proxy_port``); all
             browser traffic is routed through it.
+        on_escape: Called (with a reason) when the browser starts any program that is
+            not Chrome; that program is terminated by the process jail (proc_jail).
+            Apply sessions must pass it; on Windows the jail is then mandatory.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -307,7 +316,21 @@ def launch_chrome(worker_id: int, port: int | None = None,
         import os
         kwargs["preexec_fn"] = os.setsid
 
-    proc = subprocess.Popen(cmd, **kwargs)
+    if on_escape is not None:
+        from applypilot.apply import proc_jail
+        if not proc_jail.jail_supported():
+            raise RuntimeError("the browser process jail is only available on Windows; "
+                               "refusing to start an apply browser without it")
+        jail = proc_jail.ProcessJail([chrome_exe], on_escape)
+        try:
+            proc = jail.spawn(cmd, **kwargs)
+        except Exception:
+            jail.close()
+            raise
+        with _chrome_lock:
+            _jails[worker_id] = jail
+    else:
+        proc = subprocess.Popen(cmd, **kwargs)
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
@@ -327,6 +350,10 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     """
     if process and process.poll() is None:
         _kill_process_tree(process.pid)
+    with _chrome_lock:
+        jail = _jails.pop(worker_id, None)
+    if jail is not None:
+        jail.close()  # terminates anything left in the browser's job
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
