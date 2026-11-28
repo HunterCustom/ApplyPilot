@@ -25,7 +25,8 @@ BASE_CDP_PORT = 9222
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
-_jails: dict[int, object] = {}  # worker_id -> proc_jail.ProcessJail
+_jails: dict[int, typing.Any] = {}  # worker_id -> proc_jail.ProcessJail
+
 
 _chrome_lock = threading.Lock()
 
@@ -269,7 +270,24 @@ def chrome_command(chrome_exe: str, port: int, profile_dir: Path, headless: bool
     return cmd
 
 
+# Apply sessions only ever run Google Chrome / Chromium. A CHROME_PATH pointing at another
+# browser (a personal browser such as Vivaldi, Edge, Brave ...) is refused, never launched.
+CHROME_BINARY_NAMES = frozenset({"chrome.exe", "chromium.exe", "chrome", "chromium", "chromium-browser",
+                                 "google-chrome", "google-chrome-stable", "google chrome"})
+
+
+def require_chrome_binary(path: str) -> str:
+    """The resolved path if it is a Chrome/Chromium executable, else RuntimeError."""
+    import os
+    real = os.path.realpath(path)
+    if os.path.basename(real).lower() not in CHROME_BINARY_NAMES or not os.path.isfile(real):
+        raise RuntimeError(f"refusing to launch {os.path.basename(real)!r}: ApplyPilot runs only Google Chrome or "
+                           "Chromium (set CHROME_PATH to chrome.exe)")
+    return real
+
+
 def launch_chrome(worker_id: int, port: int | None = None,
+
                   headless: bool = False, proxy_port: int | None = None,
                   on_escape=None) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
@@ -304,7 +322,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
 
-    chrome_exe = config.get_chrome_path()
+    chrome_exe = require_chrome_binary(config.get_chrome_path())
 
     from applypilot.apply.network_guard import disable_external_protocols
     disable_external_protocols(profile_dir)
@@ -316,12 +334,19 @@ def launch_chrome(worker_id: int, port: int | None = None,
         import os
         kwargs["preexec_fn"] = os.setsid
 
-    if on_escape is not None:
-        from applypilot.apply import proc_jail
-        if not proc_jail.jail_supported():
-            raise RuntimeError("the browser process jail is only available on Windows; "
-                               "refusing to start an apply browser without it")
-        jail = proc_jail.ProcessJail([chrome_exe], on_escape)
+    from applypilot.apply import proc_jail
+    if on_escape is not None and not proc_jail.jail_supported():
+        raise RuntimeError("the browser process jail is only available on Windows; "
+                           "refusing to start an apply browser without it")
+    if proc_jail.jail_supported():
+        # Every ApplyPilot Chrome is jailed on Windows (audit H4), with or without a caller callback:
+        # an external program it starts is terminated before it runs, and the browser is stopped.
+        def _default_escape(why: str, wid: int = worker_id) -> None:
+            logger.error("[worker-%d] %s; stopping the browser", wid, why)
+            p = _chrome_procs.get(wid)
+            if p is not None:
+                _kill_process_tree(p.pid)
+        jail = proc_jail.ProcessJail([chrome_exe], on_escape or _default_escape)
         try:
             proc = jail.spawn(cmd, **kwargs)
         except Exception:
@@ -336,6 +361,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     # Give Chrome time to start and open the debug port
     time.sleep(3)
+    if proc.poll() is not None:
+        # rc 21: another Chrome already owns this profile and took over the launch (process
+        # singleton), so this one never opens its debugger -- one cause of "debugger unreachable".
+        raise RuntimeError(f"Chrome exited during start-up (rc={proc.returncode}); "
+                           + ("its profile directory is in use by another Chrome" if proc.returncode == 21
+                              else "see the Chrome log"))
     logger.info("[worker-%d] Chrome started on port %d (pid %d)",
                 worker_id, port, proc.pid)
     return proc

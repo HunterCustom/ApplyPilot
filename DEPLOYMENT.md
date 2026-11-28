@@ -7,7 +7,8 @@ submits an application unless you run `applypilot apply` without `--dry-run` **a
 ## 1. Requirements
 - Windows 10/11 (the browser process jail is Windows-only; `apply` refuses to start without it).
 - Python 3.11+ (developed on 3.13), Git, Google Chrome (`C:\Program Files\Google\Chrome\Application\chrome.exe`
-  or `CHROME_PATH`). Node.js 18+ and Claude Code CLI only for `apply`.
+  or `CHROME_PATH` pointing at a `chrome.exe`; any other browser binary is refused). Each worker uses its
+  own profile directory; if another Chrome holds it, start-up fails with "profile directory is in use". Node.js 18+ and Claude Code CLI only for `apply`.
 - A local OpenAI-compatible LLM. Verified baseline: **LM Studio, `qwen/qwen3-14b`** at
   `http://127.0.0.1:1234/v1`. Other models: set `LLM_MODEL` explicitly (never changed silently).
 

@@ -140,6 +140,34 @@ class ProcessJail:
         finally:
             self.k32.CloseHandle(self._wt.HANDLE(h))
 
+    def pids(self) -> list[int]:
+        """Every process currently in the job (JobObjectBasicProcessIdList)."""
+        ct, wt = self._ct, self._wt
+        n = 4096
+
+        class LIST(ct.Structure):
+            _fields_ = [("Assigned", wt.DWORD), ("InList", wt.DWORD), ("Ids", ct.c_size_t * n)]  # noqa: RUF012
+
+        buf = LIST()
+        if not self.k32.QueryInformationJobObject(self.job, 3, ct.byref(buf), ct.sizeof(buf), None):
+            raise OSError(ct.get_last_error(), "QueryInformationJobObject failed")
+        return [int(buf.Ids[i]) for i in range(buf.InList)]
+
+    def images(self) -> list[str]:
+        """Executable path of every live process in the job (for prevention tests)."""
+        out = []
+        for pid in self.pids():
+            h = self.k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                continue
+            try:
+                img = self._image(self._wt.HANDLE(h))
+                if img:
+                    out.append(img)
+            finally:
+                self.k32.CloseHandle(self._wt.HANDLE(h))
+        return out
+
     # --- monitor ---------------------------------------------------------------------
     def _image(self, h) -> str | None:
         buf = self._ct.create_unicode_buffer(32768)

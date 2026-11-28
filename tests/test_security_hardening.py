@@ -366,6 +366,67 @@ class TargetSelectionTests(TempDirCase):
 
 # --- H4: process jail ----------------------------------------------------------------------------------
 
+class BrowserContainmentPolicyTests(unittest.TestCase):
+    """Personal browsers and OS protocol handlers can never be reached from ApplyPilot (audit H4)."""
+
+    def test_only_chrome_binaries_are_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("vivaldi.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "cmd.exe"):
+                p = Path(d) / name
+                p.write_bytes(b"")
+                with self.subTest(name=name), self.assertRaises(RuntimeError):
+                    chrome.require_chrome_binary(str(p))
+            ok = Path(d) / "chrome.exe"
+            ok.write_bytes(b"")
+            self.assertEqual(Path(chrome.require_chrome_binary(str(ok))).name, "chrome.exe")
+        with self.assertRaises(RuntimeError):
+            chrome.require_chrome_binary(r"C:\nonexistent\chrome.exe")
+
+    @unittest.skipUnless(proc_jail.jail_supported(), "process jail is Windows-only")
+    def test_every_launch_is_jailed_even_without_a_callback(self):
+        spawned = {}
+
+        class FakeJail:
+            def __init__(self, allowed, on_escape):
+                spawned["allowed"], spawned["cb"] = allowed, on_escape
+
+            def spawn(self, cmd, **kw):
+                spawned["cmd"] = cmd
+                return mock.Mock(pid=1, poll=lambda: None)
+
+            def close(self):
+                pass
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(chrome, "acquire_worker_slot"), \
+                mock.patch.object(chrome, "setup_worker_profile", return_value=Path(d)), \
+                mock.patch.object(chrome, "_kill_on_port", return_value=True), \
+                mock.patch.object(chrome.config, "get_chrome_path", return_value=sys.executable), \
+                mock.patch.object(chrome, "require_chrome_binary", side_effect=lambda p: p), \
+                mock.patch.object(proc_jail, "ProcessJail", FakeJail), \
+                mock.patch.object(chrome.time, "sleep"), \
+                mock.patch.object(chrome.subprocess, "Popen", side_effect=AssertionError("unjailed launch")):
+            chrome.launch_chrome(42, port=9555, headless=True, proxy_port=None)
+            chrome._jails.pop(42, None)
+            chrome._chrome_procs.pop(42, None)
+        self.assertEqual(spawned["allowed"], [sys.executable])
+        self.assertTrue(callable(spawned["cb"]))
+
+    def test_no_fixture_can_hand_a_url_to_the_os(self):
+        """No test or script may open/click a non-web scheme: that is how Vivaldi was launched."""
+        import re
+        schemes = "|".join(["mail" + "to", "t" + "el", "s" + "ms", "call" + "to", "ms-[a-z-]+", "search-ms", "skype",
+                            "zoommtg", "slack", "msteams", "web" + "cal", "vivaldi", "microsoft-edge"])
+        # (file: is not an OS handoff -- Chrome handles it and Fetch blocks it; see test_file_scheme_not_reachable)
+        bad = re.compile(r"""(href|src|action|navigate|open|location)\W{0,6}["'](""" + schemes + "):", re.IGNORECASE)
+        root = Path(__file__).resolve().parent.parent
+        hits = []
+        for f in list((root / "tests").glob("*.py")) + list((root / "scripts").glob("*.py")):
+            for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if bad.search(line):
+                    hits.append(f"{f.name}:{i}")
+        self.assertEqual(hits, [])
+
+
 @unittest.skipUnless(proc_jail.jail_supported(), "process jail is Windows-only")
 class ProcessJailTests(unittest.TestCase):
     def test_child_program_terminated_and_reported(self):

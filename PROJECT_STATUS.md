@@ -18,7 +18,7 @@ Operating guide: `DEPLOYMENT.md`. Completion summary: `PROJECT_COMPLETION_REPORT
 | Daily | `applypilot daily` (lock, limits, model check, JSONL log, exit codes 0–4); `scripts/run_daily.ps1` + Task Scheduler template. Not scheduled on this PC. |
 | Reports | `applypilot report <name>` with filter/sort/CSV/JSON (no profile data). |
 | Apply | Phase 3b + audit fixes (`66b3c45`): proxy kill switch + write gate, process jail, causal evidence, atomic approvals, tenant scoping. **Still not certified submission-proof; no apply run yet (dry or real).** |
-| Tests | 255 pass incl. 20 real-Chrome tests (installed Chrome 158, jailed, loopback fixtures only); see `PROJECT_COMPLETION_REPORT.md`. |
+| Tests | 258 pass incl. 20 real-Chrome tests (installed Chrome 158, jailed, loopback fixtures only); see `PROJECT_COMPLETION_REPORT.md`. |
 
 ## Safety model (apply)
 - **Statuses**: NULL/`failed` (retryable), `dry_run`, `in_progress`, `applied`, `needs_review`, `manual`.

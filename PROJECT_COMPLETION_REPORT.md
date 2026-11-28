@@ -19,7 +19,7 @@ certified submission-proof**; no apply session (dry or real) was run and no empl
 | (docs commit) | `DEPLOYMENT.md`, this report, status/roadmap/security plan, scheduler wrapper + template |
 
 ## 3. Test and quality results (final run)
-- `pytest tests/`: **255 passed, 138 subtests, 0 skipped, 92.9 s**, including 20 real-Chrome tests run
+- `pytest tests/`: **258 passed, 144 subtests, 0 skipped, 96.9 s**, including 20 real-Chrome tests run
   against the installed `C:\Program Files\Google\Chrome\Application\chrome.exe` (headless, temp profiles,
   inside the process jail, loopback synthetic servers only). Baseline was 190.
 - New: `tests/test_security_hardening.py` (24), `tests/test_preparation_pipeline.py` (36) + browser tests
@@ -35,6 +35,25 @@ certified submission-proof**; no apply session (dry or real) was run and no empl
 - Real-data validation on a **copy** of the dev DB (backup API from a read-only connection; original
   untouched; no network, no LLM): additive migration of 896 rows OK; dedupe found 22 → after the fix 2
   merges, both true duplicates (same direct application URL).
+
+## 3b. Browser-containment follow-up (after the updated audit)
+- **Only Chrome is ever launched.** `chrome.require_chrome_binary` refuses any executable not named
+  chrome/chromium (Vivaldi, Edge, Brave, … even via `CHROME_PATH`). Every ApplyPilot Chrome on Windows is
+  jailed, with or without a caller callback; `scripts/live_policy_probe.py` was previously unjailed.
+- **Tests prove prevention, not logging.** Browser tests use exactly
+  `C:\Program Files\Google\Chrome\Application\chrome.exe` and a fresh temp profile. The jail test lists
+  every process in the browser's job and requires all of them to be that Chrome. The `file:` test checks
+  the page never received the file's contents. A repository test fails if any test or script fixture
+  could open/click an OS-handoff scheme. Windows defaults and protocol associations were not modified.
+- **Vivaldi check.** Process metadata only (no command lines): the only top-level Vivaldi process was
+  started by Explorer at 11:34 (your session); every Vivaldi process created during the test runs was
+  a child of that session. Nothing in this work launched Vivaldi.
+- **Debugger failure Codex saw.** Not reproducible here: installed Chrome 158.0.8127.88 opened its debugger
+  in ~0.7 s with a fresh profile (headless, jailed, with and without a fixed port; no Chrome policies set).
+  One cause was reproduced: launching on a profile directory already used by another Chrome makes the
+  new process hand off and exit (rc 21) without a debugger. The launcher now reports that case. The
+  other likely cause is Codex's own sandbox (it reported loopback socket stalls). A real OS handoff
+  end-to-end cannot be tested without changing protocol associations, which you ruled out.
 
 ## 4. Implemented and verified (synthetic tests)
 | Area | What |

@@ -27,7 +27,6 @@ from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
-from applypilot import config
 from applypilot.apply import approval, chrome, launcher, policy_hook, proc_jail
 from applypilot.apply import network_policy as NP
 from applypilot.apply import policy as P
@@ -476,13 +475,16 @@ class ProxyTests(TempDirCase):
 
 # --- Real browser, driven directly over CDP (no model) ------------------------------------
 
+# Browser tests use exactly this executable -- never CHROME_PATH, never another browser binary.
+INSTALLED_CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+
 def _chrome_exe():
-    if os.environ.get("APPLYPILOT_SKIP_BROWSER_TESTS") == "1":
+    if os.environ.get("APPLYPILOT_SKIP_BROWSER_TESTS") == "1" or not proc_jail.jail_supported():
         return None
-    try:
-        return config.get_chrome_path()
-    except Exception:  # noqa: BLE001 -- no Chrome: browser tests skip
-        return None
+    if not os.path.isfile(INSTALLED_CHROME):
+        return None  # browser tests skip
+    return chrome.require_chrome_binary(INSTALLED_CHROME)
 
 
 CHROME = _chrome_exe()
@@ -654,6 +656,10 @@ class BrowserBoundaryTests(TempDirCase):
         net = P.read_jsonl(self.tmp / "network.jsonl")
         self.assertTrue(any(r.get("url", "").startswith("file:") and r["decision"] == "block" for r in net))
         self.assertTrue(P.session_halted(self.policy))
+        # Prevented, not just logged: the page never received the file's contents.
+        body = self.driver.eval("document.documentElement ? document.documentElement.innerText : ''") or ""
+        self.assertNotIn("16-bit", body)
+        self.assertFalse(str(self.driver.eval("location.href")).startswith("file:"))
 
     # -- dry-run submission boundary (label-free) --
     def test_continue_button_cannot_transmit_in_dry_run(self):
@@ -722,8 +728,14 @@ class BrowserBoundaryTests(TempDirCase):
     def test_browser_runs_inside_the_process_jail(self):
         self.launch()
         self.assertTrue(self.jail.contains(self.proc.pid))
-        self.driver.navigate(self.A + "/", settle=0.5)
+        for page in ("/", "/popup", "/worker", "/sw-page"):
+            self.driver.navigate(self.A + page, settle=0.8)
         self.assertEqual(self.escapes, [])
+        # Prevention, not detection: every process that exists in the browser's job is that Chrome.
+        images = {os.path.normcase(os.path.realpath(p)) for p in self.jail.images()}
+        self.assertGreater(len(self.jail.pids()), 1)  # renderers etc. really are inside the job
+        self.assertEqual(images, {os.path.normcase(os.path.realpath(CHROME))})
+
 
     # -- real-run approval at the network layer --
     def test_real_run_post_needs_single_use_grant(self):
