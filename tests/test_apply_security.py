@@ -516,9 +516,14 @@ class BrowserIsolationTests(TempDirCase):
 
 class PromptTests(TempDirCase):
     def build(self, **kw):
+        import hashlib
         pdf = self.tmp / "r.pdf"
         pdf.write_bytes(b"%PDF-1.4 synthetic")
-        job = {**JOB, "tailored_resume_path": str(self.tmp / "r.txt"), "fit_score": 8}
+        txt = self.tmp / "r.txt"
+        txt.write_text("resume text", encoding="utf-8")
+        job = {**JOB, "tailored_resume_path": str(txt), "fit_score": 8, "resume_validation": "passed",
+               "resume_sha": hashlib.sha256(txt.read_bytes()).hexdigest(), "resume_pdf_path": str(pdf),
+               "resume_pdf_sha": hashlib.sha256(pdf.read_bytes()).hexdigest()}
         with mock.patch.object(config, "load_profile", return_value=PROFILE), \
                 mock.patch.object(config, "load_search_config", return_value={}), \
                 mock.patch.object(config, "load_blocked_sso", return_value=["accounts.google.com"]):

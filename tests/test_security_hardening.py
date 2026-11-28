@@ -353,7 +353,8 @@ class TargetSelectionTests(TempDirCase):
         conn.execute("""CREATE TABLE jobs (url TEXT PRIMARY KEY, title TEXT, site TEXT, application_url TEXT,
             tailored_resume_path TEXT, fit_score INT, location TEXT, full_description TEXT, cover_letter_path TEXT,
             eligibility_status TEXT, eligibility_reason TEXT, eligibility_version TEXT, apply_status TEXT,
-            apply_attempts INT, eligibility_tier TEXT, readiness TEXT, review_status TEXT, duplicate_of TEXT)""")
+            apply_attempts INT, eligibility_tier TEXT, readiness TEXT, review_status TEXT, duplicate_of TEXT,
+            applied_at TEXT)""")
         from applypilot import eligibility
         conn.execute("INSERT INTO jobs (url, title, application_url, tailored_resume_path, eligibility_status,"
                      " eligibility_version, readiness, review_status) VALUES (?,?,?,?,?,?,'ready','approved')",

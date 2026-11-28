@@ -454,12 +454,41 @@ class RetryAndRecoveryTests(ApplySafetyTestCase):
     def test_late_result_cannot_overwrite_manual_resolution(self):
         self.add_job(f"{ATS}/1")
         job = launcher.acquire_job()
-        launcher.mark_job(job["url"], "failed", reason="human: not interested")  # human decides
+        # Audit R8: an operator cannot rewrite a live claim (the worker may still be acting).
+        ok, msg = launcher.mark_job(job["url"], "failed", reason="human: not interested")
+        self.assertFalse(ok)
+        self.assertIn("worker currently holds", msg)
+        self.assertEqual(self.row(job["url"])["apply_status"], "in_progress")
+        # Once the claim is resolved (here: stale-claim style release by another owner), a late
+        # result from the old owner cannot overwrite the human's decision.
+        self.conn.execute("UPDATE jobs SET apply_status = 'failed', agent_id = NULL WHERE url = ?", (job["url"],))
+        self.conn.commit()
+        ok, _ = launcher.mark_job(job["url"], "failed", reason="human: not interested")
+        self.assertTrue(ok)
         outcome = launcher.record_outcome(job["url"], "applied", dry_run=False, owner=job["agent_id"])
         self.assertEqual(outcome, "ownership_lost")
         row = self.row(job["url"])
         self.assertEqual(row["apply_status"], "failed")
         self.assertIsNone(row["applied_at"])
+
+    def test_mark_failed_never_erases_an_application(self):
+        """Audit R8: --mark-failed + --reset-failed used to turn an applied row back into a claimable one."""
+        self.add_job(f"{ATS}/done")
+        self.conn.execute("UPDATE jobs SET apply_status = 'applied', applied_at = '2026-11-01T00:00:00+00:00'"
+                          " WHERE url = ?", (f"{ATS}/done",))
+        self.conn.commit()
+        ok, msg = launcher.mark_job(f"{ATS}/done", "failed", reason="oops")
+        self.assertFalse(ok)
+        self.assertIn("application is recorded", msg)
+        # Even a status that was corrupted by hand cannot make an applied row claimable again.
+        self.conn.execute("UPDATE jobs SET apply_status = 'failed' WHERE url = ?", (f"{ATS}/done",))
+        self.conn.commit()
+        self.assertEqual(launcher.reset_failed(), 0)
+        self.assertIsNone(launcher.acquire_job())
+        self.assertIsNotNone(self.row(f"{ATS}/done")["applied_at"])
+        events = [r[0] for r in self.conn.execute("SELECT event FROM application_events WHERE url = ?",
+                                                  (f"{ATS}/done",))]
+        self.assertEqual(events, [])  # refused changes leave no history entry
 
     def test_late_result_cannot_overwrite_another_workers_claim(self):
         self.add_job(f"{ATS}/1")

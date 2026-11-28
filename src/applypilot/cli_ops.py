@@ -38,11 +38,18 @@ def register(app: typer.Typer) -> None:
 
         from applypilot.database import get_connection
         conn = get_connection()
+        from applypilot.verify import preferred_url
         for url, status in ((confirm_active, "active"), (mark_closed, "closed")):
             if url:
+                row = conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
+                checked = preferred_url(dict(row)) if row else ""
+                if status == "active" and row:
+                    console.print(f"Confirming the posting at: {_e(checked)}")
+                # The human confirmation is bound to the URL that was confirmed (audit R3).
                 n = conn.execute("UPDATE jobs SET posting_status = ?, posting_reason = 'confirmed by a human',"
-                                 " posting_checked_at = ? WHERE url = ?",
-                                 (status, datetime.now(UTC).isoformat(), url)).rowcount
+                                 " posting_checked_at = ?, posting_verified_url = ?, posting_final_url = NULL"
+                                 " WHERE url = ?",
+                                 (status, datetime.now(UTC).isoformat(), checked, url)).rowcount
                 conn.commit()
                 console.print(f"{'Recorded' if n else '[red]No job with that exact URL[/red]'}: {_e(url)} -> {status}")
                 raise typer.Exit(code=0 if n else 1)

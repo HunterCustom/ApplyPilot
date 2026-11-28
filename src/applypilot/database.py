@@ -231,6 +231,19 @@ _ALL_COLUMNS: dict[str, str] = {
     "review_status": "TEXT",        # approved | rejected | deferred | manual_submitted
     "review_note": "TEXT",
     "reviewed_at": "TEXT",
+    # Immutable artifact binding (scoring.documents): exact content hashes of the approved
+    # text, the PDF rendered from that text, and the hashes a human approved.
+    "resume_sha": "TEXT",
+    "resume_pdf_path": "TEXT",
+    "resume_pdf_sha": "TEXT",
+    "cover_sha": "TEXT",
+    "cover_pdf_path": "TEXT",
+    "cover_pdf_sha": "TEXT",
+    "cover_for": "TEXT",            # input fingerprint the cover letter was made from
+    "review_artifacts": "TEXT",     # JSON manifest of hashes at human approval
+    # Verification / eligibility input binding (applypilot.verify, eligibility)
+    "posting_final_url": "TEXT",    # URL actually reached after redirects
+    "eligibility_input": "TEXT",    # hash of the inputs the eligibility decision used
 }
 
 # Auxiliary tables (created if missing; never dropped).
@@ -250,6 +263,11 @@ _AUX_TABLES = (
 
         run_id TEXT PRIMARY KEY, kind TEXT, started_at TEXT, finished_at TEXT, status TEXT,
         exit_code INTEGER, summary TEXT)""",
+    # Append-only application/review history (never updated or deleted by ApplyPilot).
+    """CREATE TABLE IF NOT EXISTS application_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, at TEXT NOT NULL, event TEXT NOT NULL,
+        actor TEXT, detail TEXT)""",
+    "CREATE INDEX IF NOT EXISTS idx_application_events_url ON application_events(url)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_key ON jobs(dedupe_key)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_application_url ON jobs(application_url)",
 )
@@ -259,6 +277,12 @@ def ensure_aux_tables(conn: sqlite3.Connection) -> None:
     for sql in _AUX_TABLES:
         conn.execute(sql)
     conn.commit()
+
+
+def log_event(conn: sqlite3.Connection, url: str, event: str, detail: str = "", actor: str = "") -> None:
+    """Append one application/review history record (caller commits with its own change)."""
+    conn.execute("INSERT INTO application_events (url, at, event, actor, detail) VALUES (?, ?, ?, ?, ?)",
+                 (url, datetime.now(UTC).isoformat(), event, actor or None, (detail or "")[:500] or None))
 
 
 def record_sighting(conn: sqlite3.Connection, url: str, source: str, *, company: str | None = None,
@@ -309,23 +333,30 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     if conn is None:
         conn = get_connection()
 
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    added = []
-
-    for col, dtype in _ALL_COLUMNS.items():
-        if col not in existing:
-            # PRIMARY KEY columns can't be added via ALTER TABLE, but url
-            # is always created with the table itself so this is safe
-            if "PRIMARY KEY" in dtype:
-                continue
-            conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}")
-            added.append(col)
-
-    if added:
+    # Serialized (audit R5/R9): the schema is read and altered inside one write transaction, so two
+    # processes bootstrapping an older database at the same time cannot both try the same ALTER.
+    if conn.in_transaction:
         conn.commit()
-    ensure_aux_tables(conn)
-
+    conn.execute("BEGIN IMMEDIATE")
+    added = []
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        for col, dtype in _ALL_COLUMNS.items():
+            if col not in existing:
+                # PRIMARY KEY columns can't be added via ALTER TABLE, but url
+                # is always created with the table itself so this is safe
+                if "PRIMARY KEY" in dtype:
+                    continue
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}")
+                added.append(col)
+        for sql in _AUX_TABLES:
+            conn.execute(sql)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     return added
+
 
 
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:

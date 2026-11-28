@@ -11,6 +11,7 @@ to avoid apologetic spirals.
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,14 +163,15 @@ ISSUES: (list any problems, or "none")
 - Reordering anything
 - Changing the title or summary completely
 
-## TOLERANCE RULE:
-The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
-- Adding a closely related tool the candidate could realistically know is a MINOR STRETCH, not fabrication.
-- Reframing a metric with slightly different wording is a MINOR STRETCH.
-- Adding any LEARNABLE skill given their existing stack is a MINOR STRETCH.
-- Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
+## NO TOLERANCE FOR UNSUPPORTED FACTS:
+Every skill, tool, certification, degree, title, employer, responsibility, number and duration must be
+supported by the original resume. "Closely related", "learnable" or "realistic" additions are FAIL.
+A number or date attributed to a different employer or project than in the original is FAIL.
+Leadership or supervision that the original does not describe is FAIL.
 
-Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
+Do not fail for style, tone, or restructuring of supported facts.
+
+Your first line must be exactly "VERDICT: PASS" or "VERDICT: FAIL" and must be the only VERDICT line."""
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
@@ -326,19 +328,39 @@ def judge_tailored_resume(
 
     client = get_client()
     response = client.chat(messages, max_tokens=512, temperature=0.1)
-
-    passed = "VERDICT: PASS" in response.upper()
-    issues = "none"
-    if "ISSUES:" in response.upper():
-        issues_idx = response.upper().index("ISSUES:")
-        issues = response[issues_idx + 7:].strip()
-
+    verdict, issues = parse_judge_verdict(response)
     return {
-        "passed": passed,
-        "verdict": "PASS" if passed else "FAIL",
+        "passed": verdict == "PASS",
+        "verdict": verdict,
         "issues": issues,
         "raw": response,
     }
+
+
+_VERDICT_LINE_RE = re.compile(r"^\s*\**\s*VERDICT\s*\**\s*:\s*\**\s*(PASS|FAIL)\s*\**\s*\.?\s*$", re.IGNORECASE)
+_VERDICT_ANY_RE = re.compile(r"VERDICT\s*\**\s*:", re.IGNORECASE)
+
+
+def parse_judge_verdict(response: str) -> tuple[str, str]:
+    """Strict structured verdict: ("PASS" | "FAIL" | "MALFORMED", issues).
+
+    PASS only when the response contains exactly one VERDICT, it is on its own line, it is the
+    first non-empty line, and it says PASS. Anything else (FAIL anywhere, two verdicts, a verdict
+    quoted inside prose, no verdict) is not a pass -- the judge can never be read as accepting
+    output it did not unambiguously accept.
+    """
+    text = (response or "").replace("\r\n", "\n")
+    issues = "none"
+    m_iss = re.search(r"ISSUES\s*:", text, re.IGNORECASE)
+    if m_iss:
+        issues = text[m_iss.end():].strip() or "none"
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if len(_VERDICT_ANY_RE.findall(text)) != 1 or not lines:
+        return ("FAIL" if re.search(r"\bFAIL\b", text, re.IGNORECASE) else "MALFORMED"), issues
+    m = _VERDICT_LINE_RE.match(lines[0])
+    if not m:
+        return ("FAIL" if re.search(r"\bFAIL\b", text, re.IGNORECASE) else "MALFORMED"), issues
+    return m.group(1).upper(), issues
 
 
 # ── Core Tailoring ───────────────────────────────────────────────────────
@@ -563,19 +585,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             )
             job_path.write_text(job_desc, encoding="utf-8")
 
-            # PDF only for approved resumes (best-effort)
-            pdf_path = None
-            if approved:
-                try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
-
+            # The validated text is identified by its hash; the PDF is rendered (and bound to that
+            # hash) after persisting, so a PDF can never stand for text it was not made from.
             result = {
                 "url": job["url"],
                 "path": str(txt_path),
-                "pdf_path": pdf_path,
+                "sha": D.sha_file(txt_path) if approved else None,
                 "title": job["title"],
                 "site": job["site"],
                 "status": report["status"],
@@ -586,7 +601,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+                "status": "error", "attempts": 0, "path": None, "sha": None,
             }
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
@@ -607,12 +622,14 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     # Persist: the path is saved ONLY for approved resumes; rejected ones keep their own path/reasons.
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
-        if r["status"] in APPROVED_STATUSES:
+        if r["status"] in APPROVED_STATUSES and r.get("sha"):
+            # New text: any earlier PDF, cover letter and human approval no longer describe it.
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, resume_validation='passed', "
-                "resume_validation_reasons=NULL, resume_model=?, documents_for=?, "
+                "resume_validation_reasons=NULL, resume_model=?, documents_for=?, resume_sha=?, "
+                "resume_pdf_path=NULL, resume_pdf_sha=NULL, review_artifacts=NULL, "
                 "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, model, r.get("fingerprint"), r["url"]),
+                (r["path"], now, model, r.get("fingerprint"), r["sha"], r["url"]),
             )
         elif r["status"] == "error":
             conn.execute("UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?", (r["url"],))
@@ -624,6 +641,18 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "resume_model=?, tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                 (state, json.dumps(r.get("reasons") or [r["status"]]), r["path"], model, r["url"]),
             )
+    conn.commit()
+
+    # Render PDFs for the newly approved texts (bound to the recorded hash; best-effort -- a job
+    # without a bound PDF is simply not ready, and the pdf stage retries it).
+    from applypilot.scoring.pdf import render_job_document
+    for r in results:
+        if r["status"] in APPROVED_STATUSES and r.get("sha"):
+            row = conn.execute("SELECT * FROM jobs WHERE url = ?", (r["url"],)).fetchone()
+            try:
+                render_job_document(conn, dict(row), "resume")
+            except Exception:
+                log.debug("PDF generation failed for %s", r["path"], exc_info=True)
     conn.commit()
 
     elapsed = time.time() - t0

@@ -128,6 +128,16 @@ Testy Applicant
 """
 
 
+
+def _fake_pdf(p, kind=None, **_kw):
+    """Stand-in renderer: a deterministic 'PDF' derived from the exact text (real rendering is
+    exercised by RenderSafetyTests)."""
+    import hashlib
+    src = Path(p)
+    out = src.with_suffix(".pdf")
+    out.write_bytes(b"%PDF-fake " + hashlib.sha256(src.read_bytes()).hexdigest().encode())
+    return out
+
 class FakeLLM:
     """Answers by prompt type. ``judge``: PASS/FAIL; ``tailor``: dict or callable; ``score``: text."""
 
@@ -177,7 +187,7 @@ class TempEnv(unittest.TestCase):
             mock.patch.object(cover_letter, "COVER_LETTER_DIR", self.app / "cover_letters"),
             mock.patch.object(cover_letter, "load_profile", return_value=PROFILE),
             mock.patch.object(scorer, "RESUME_PATH", self.app / "resume.txt"),
-            mock.patch("applypilot.scoring.pdf.convert_to_pdf", side_effect=lambda p: Path(p).with_suffix(".pdf")),
+            mock.patch("applypilot.scoring.pdf.convert_to_pdf", side_effect=_fake_pdf),
         ]
         for p in self.patches:
             p.start()
@@ -396,7 +406,9 @@ class FactcheckTests(unittest.TestCase):
 class TailorTests(TempEnv):
     def job(self, url="https://careers.synthbank.test/jobs/77"):
         self.add(url, application_url=url, fit_score=8, posting_status="active", posting_checked_at=NOW.isoformat(),
+                 posting_verified_url=url,
                  eligibility_status="eligible_manual", eligibility_version=eligibility.MANUAL_VERSION)
+        eligibility.set_manual_decision(url, True, "synthetic", conn=self.conn)  # binds the decision to inputs
         return url
 
     def test_judge_rejected_resume_never_becomes_ready(self):

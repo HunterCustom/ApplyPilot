@@ -60,6 +60,25 @@ _DATE_RANGE_RE = re.compile(
     r"(?:present|current|now|((?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+)?(19|20)\d{2})",
     re.IGNORECASE)
 _ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9+/&-]{1,7}\b")
+# Degree / education claims (audit R1): each degree term and each named institution in a document
+# must occur in the sources; an invented degree is never "rewording".
+_DEGREE_RE = re.compile(
+    r"\b(bachelor(?:'?s)?|master(?:'?s)?|associate(?:'?s)? degree|associate of|doctorate|ph\.?\s?d\.?|"
+    r"b\.\s?s\.|b\.\s?a\.|m\.\s?s\.|m\.\s?b\.\s?a\.|bsc|msc|mba|aas|a\.a\.s\.|diploma|degree|graduated|"
+    r"certificate program)\b", re.IGNORECASE)
+_INSTITUTION_RE = re.compile(
+    r"\b((?:[A-Z][a-zA-Z&.'-]+\s+){0,4}(?:University|College|Institute|Academy|Polytechnic)"
+    r"(?:\s+of(?:\s+[A-Z][a-zA-Z&.'-]+){1,4})?)")
+# Seniority / leadership claims: must be supported by the sources, not inferred from responsibility.
+_SENIORITY_RE = re.compile(r"\b(senior|sr\.|lead|principal|staff|head of|chief|director|manager|supervisor|"
+                           r"team lead|architect)\b", re.IGNORECASE)
+_LEADERSHIP_RE = re.compile(
+    r"\b(led|lead|leading|managed|managing|supervised|supervising|directed|mentored|mentoring|oversaw|"
+    r"overseeing|headed)\b(?:\W+\w+){0,4}?\W+(team|teams|staff|technicians|engineers|employees|people|reports|"
+    r"direct reports|crew|department)\b", re.IGNORECASE)
+_CONTACT_RE = re.compile(r"@|https?://|www\.|\(\d{3}\)\s*\d{3}[-.\s]\d{4}|\b\d{3}[-.]\d{3}[-.]\d{4}\b")
+_STOP = frozenset(
+["a", "an", "and", "the", "of", "for", "to", "in", "on", "with", "by", "at", "from", "as", "or", "into", "across", "over", "under", "via", "per", "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those", "their", "its", "our", "your", "my", "we", "i", "you", "he", "she", "they", "it", "all", "any", "each", "more", "most", "other", "such", "than", "then", "also", "using", "used", "use", "including", "include", "includes", "provide", "provided", "providing", "support", "supported", "supporting", "work", "worked", "working", "experience", "experienced"])
 _SECTION_RE = re.compile(r"^(SUMMARY|TECHNICAL SKILLS|EXPERIENCE|PROJECTS|EDUCATION|CERTIFICATIONS)\s*$", re.MULTILINE)
 
 
@@ -173,10 +192,93 @@ def check_claims(document: str, sources: Sources, *, kind: str = "resume") -> li
         if not re.search(r"(?<!\d)" + m.group(1) + r"\+?\s*(?:years|yrs)", sources.text):
             problems.append(f"unsupported experience length: '{m.group(0)}'")
 
+    problems += _check_education(doc, sources)
+    problems += _check_leadership(doc, sources)
+    problems += _check_number_context(doc, sources)
+
     if kind == "resume":
         problems += _check_history(doc, sources)
     seen: set[str] = set()
     return [p for p in problems if not (p in seen or seen.add(p))]
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z][a-z0-9+#/-]{3,}", (text or "").lower()) if w not in _STOP}
+
+
+def _source_lines(sources: Sources) -> list[str]:
+    return [ln for ln in re.split(r"[\n.;]+", sources.raw) if ln.strip()]
+
+
+def _check_education(doc: str, sources: Sources) -> list[str]:
+    problems = []
+    for m in _DEGREE_RE.finditer(doc):
+        term = m.group(0)
+        if not re.search(r"(?<![a-z])" + re.escape(term.lower()) + r"(?![a-z])", sources.text):
+            problems.append(f"unsupported education claim: '{term}'")
+    for m in _INSTITUTION_RE.finditer(doc):
+        name = m.group(1).strip()
+        if len(name.split()) >= 2 and name.lower() not in sources.text:
+            problems.append(f"unsupported institution: '{name}'")
+    return problems
+
+
+def _check_leadership(doc: str, sources: Sources) -> list[str]:
+    """Leadership of people must be described in the sources in a comparable sentence."""
+    problems = []
+    src_lines = _source_lines(sources)
+    for m in _LEADERSHIP_RE.finditer(doc):
+        people = m.group(2).lower().rstrip("s")
+        people_re = re.compile(r"\b" + re.escape(people) + r"s?\b", re.IGNORECASE)
+        supported = any(_LEADERSHIP_RE.search(ln) or
+                        (re.search(r"\b(led|managed|supervised|supervising|directed|mentored|oversaw|coordinating|"
+                                   r"coordinated)\b", ln, re.IGNORECASE) and people_re.search(ln))
+                        for ln in src_lines)
+        if not supported:
+            problems.append(f"unsupported leadership claim: '{m.group(0)}'")
+    return problems
+
+
+def _check_number_context(doc: str, sources: Sources) -> list[str]:
+    """A number must appear in the sources in a sentence about the same thing (audit R1).
+
+    Each metric, count or duration in the document is looked up in the source sentences that
+    contain the same number; at least one of them must share two content words with the
+    document's sentence. A real number moved to a different employer or project fails."""
+    problems = []
+    src_lines = _source_lines(sources)
+    for line in re.split(r"[\n;]+|(?<=[a-z])\.\s", doc or ""):
+        if _CONTACT_RE.search(line):
+            continue  # code-injected contact details (phone digits are not claims)
+        nums = {n.replace(",", "") for n in re.findall(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w])", line)}
+        nums = {n for n in nums if n not in ("0", "1") and not re.fullmatch(r"(19|20)\d\d", n)}
+        if not nums:
+            continue
+        ctx = _words(line)
+        flat = line.replace(",", "")
+        for n in sorted(nums):
+            holders = [ln.replace(",", "") for ln in src_lines
+                       if re.search(r"(?<![\d.])" + re.escape(n) + r"(?![\d])", ln.replace(",", ""))]
+            if not holders:
+                problems.append(f"unsupported number: '{n}' in '{line.strip()[:80]}'")
+                continue
+            if len(ctx) >= 2 and not any(len(ctx & _words(h)) >= 2 for h in holders):
+                problems.append(f"number '{n}' is used in a different context than in the sources: "
+                                f"'{line.strip()[:80]}'")
+                continue
+            # What is counted must match: "3,500 computers" may not become "3,500 servers".
+            unit = re.search(r"(?<![\d.])" + re.escape(n) + r"\+?\s*([a-z]{3,})", flat, re.IGNORECASE)
+            # Product/model names ("Microsoft 365", "Windows 11") are names, not counts.
+            named = unit is not None and re.search(r"[A-Z][A-Za-z0-9+-]*\s+$", flat[:unit.start()])
+            if unit and not named and unit.group(1).lower() not in _STOP:
+
+                u = unit.group(1).lower().rstrip("s")
+                if not any(re.search(r"(?<![\d.])" + re.escape(n) + r"\+?\s*(?:\w+\s+){0,2}" + re.escape(u), h,
+                                     re.IGNORECASE) for h in holders):
+                    problems.append(f"number '{n}' counts '{unit.group(1)}', which the sources do not: "
+                                    f"'{line.strip()[:80]}'")
+    return problems
+
 
 
 def _check_history(doc: str, sources: Sources) -> list[str]:
@@ -192,7 +294,23 @@ def _check_history(doc: str, sources: Sources) -> list[str]:
         problems.append(f"employment dates changed or dropped: '{r}'")
     for r in sorted(new_ranges - orig_ranges):
         problems.append(f"employment dates not in the original resume: '{r}'")
+    # Titles/employers: every experience heading must be recognisable from the original, and
+    # seniority words in headings must exist in the original headings.
+    orig_heads = [ln.strip() for ln in orig_exp.splitlines() if ln.strip() and not ln.strip().startswith(("-", "*", "•"))]
+    orig_words = set().union(*[_words(h) for h in orig_heads]) if orig_heads else set()
+    orig_heads_low = " ".join(orig_heads).lower()
+    for ln in new_exp.splitlines():
+        head = ln.strip()
+        if not head or head.startswith(("-", "*", "•")):
+            continue
+        hw = _words(head)
+        if orig_heads and hw and not (hw & orig_words):
+            problems.append(f"experience heading not in the original resume: '{head[:80]}'")
+        for s in _SENIORITY_RE.finditer(head):
+            if not re.search(r"(?<![a-z])" + re.escape(s.group(0).lower()) + r"(?![a-z])", orig_heads_low):
+                problems.append(f"seniority/title not in the original resume: '{s.group(0)}' in '{head[:60]}'")
     new_exp_low = new_exp.lower()
+
     for name in sources.project_names:
         n = name.lower()
         if n and re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", new_exp_low) \

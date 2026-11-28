@@ -195,18 +195,27 @@ def apply(
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
+    from rich.markup import escape
+
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
-        mark_job(mark_applied, "applied")
-        console.print(f"[green]Marked as applied:[/green] {mark_applied}")
+        ok, msg = mark_job(mark_applied, "applied")
+        if not ok:
+            console.print(f"[red]Not changed:[/red] {escape(msg)}")
+            raise typer.Exit(code=1)
+        console.print(f"[green]Marked as applied:[/green] {escape(mark_applied)}")
         return
 
     if mark_failed:
         from applypilot.apply.launcher import mark_job
-        mark_job(mark_failed, "failed", reason=fail_reason)
-        console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
+        ok, msg = mark_job(mark_failed, "failed", reason=fail_reason)
+        if not ok:
+            console.print(f"[red]Not changed:[/red] {escape(msg)}")
+            raise typer.Exit(code=1)
+        console.print(f"[yellow]Marked as failed:[/yellow] {escape(mark_failed)} ({escape(fail_reason or 'manual')})")
         return
+
 
     if reset_failed:
         from applypilot.apply.launcher import reset_failed as do_reset

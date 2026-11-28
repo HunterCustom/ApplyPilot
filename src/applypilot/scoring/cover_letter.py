@@ -229,11 +229,14 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     except Exception:  # noqa: BLE001
         model = "unknown"
 
-    # Jobs with an approved tailored resume but no cover letter yet
+    # Jobs with a validated (hash-bound) tailored resume but no cover letter yet. Same gates as
+    # tailoring: verified-eligible, posting verified active, not a duplicate (audit R3).
+    from applypilot.eligibility import SQL_ELIGIBLE
     jobs = conn.execute(
         "SELECT * FROM jobs "
         "WHERE fit_score >= ? AND tailored_resume_path IS NOT NULL "
-        "AND COALESCE(resume_validation, 'passed') = 'passed' "
+        "AND resume_validation = 'passed' AND resume_sha IS NOT NULL "
+        f"AND {SQL_ELIGIBLE} AND posting_status = 'active' AND duplicate_of IS NULL "
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_validation, '') != 'needs_review' "
@@ -272,19 +275,11 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             approved = report["status"] == "approved"
             cl_path = D.save_artifact(COVER_LETTER_DIR, D.safe_prefix(job), "_CL", letter, report, approved)
 
-            # PDF only for approved letters (best-effort)
-            pdf_path = None
-            if approved:
-                try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(cl_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", cl_path, exc_info=True)
-
             result = {
                 "url": job["url"],
                 "path": str(cl_path),
-                "pdf_path": pdf_path,
+                "sha": D.sha_file(cl_path) if approved else None,
+                "for": D.fingerprint(job, profile, resume_text),
                 "title": job["title"],
                 "site": job["site"],
                 "approved": approved,
@@ -301,7 +296,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
-                "path": None, "pdf_path": None, "error": str(e),
+                "path": None, "sha": None, "error": str(e),
             }
             error_count += 1
             results.append(result)
@@ -311,12 +306,13 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     now = datetime.now(timezone.utc).isoformat()
     saved = 0
     for r in results:
-        if r.get("path") and r.get("approved"):
+        if r.get("path") and r.get("approved") and r.get("sha"):
             conn.execute(
                 "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, cover_validation='passed', "
-                "cover_validation_reasons=NULL, cover_model=?, "
+                "cover_validation_reasons=NULL, cover_model=?, cover_sha=?, cover_for=?, "
+                "cover_pdf_path=NULL, cover_pdf_sha=NULL, review_artifacts=NULL, "
                 "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, model, r["url"]),
+                (r["path"], now, model, r["sha"], r["for"], r["url"]),
             )
             saved += 1
         elif r.get("path"):
@@ -333,8 +329,19 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             )
     conn.commit()
 
+    from applypilot.scoring.pdf import render_job_document
+    for r in results:
+        if r.get("approved") and r.get("sha"):
+            row = conn.execute("SELECT * FROM jobs WHERE url = ?", (r["url"],)).fetchone()
+            try:
+                render_job_document(conn, dict(row), "cover")
+            except Exception:
+                log.debug("PDF generation failed for %s", r["path"], exc_info=True)
+    conn.commit()
+
     elapsed = time.time() - t0
     log.info("Cover letters done in %.1fs: %d generated, %d errors", elapsed, saved, error_count)
+
 
     return {
         "generated": saved,

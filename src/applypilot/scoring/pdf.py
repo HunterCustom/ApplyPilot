@@ -2,14 +2,33 @@
 
 Parses the structured text resume format, renders via an HTML/CSS template,
 and exports to PDF using headless Chromium via Playwright.
+
+Fork hardening (audit R2): generated prose is untrusted data. Every text field is
+HTML-escaped at the rendering boundary, the rendering context has JavaScript disabled
+and is offline with every request aborted (``RenderGuard`` counts any attempt), cover
+letters use their own paragraph template, and a PDF is written to a temporary file and
+moved into place only after a successful render.
 """
 
+import html as _html
 import logging
+import os
 from pathlib import Path
 
 from applypilot.config import TAILORED_DIR
 
 log = logging.getLogger(__name__)
+
+
+def _esc(value) -> str:
+    return _html.escape(str(value or ""), quote=True)
+
+
+def _escaped(resume: dict) -> dict:
+    """Copy of a parsed resume with every text field HTML-escaped (parsing is unaffected)."""
+    out = {k: _esc(resume.get(k)) for k in ("name", "title", "location", "contact")}
+    out["sections"] = {k: _esc(v) for k, v in (resume.get("sections") or {}).items()}
+    return out
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
@@ -157,6 +176,7 @@ def build_html(resume: dict) -> str:
     Returns:
         Complete HTML string ready for PDF rendering.
     """
+    resume = _escaped(resume)
     sections = resume["sections"]
 
     # Skills
@@ -333,32 +353,76 @@ li {{
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
 
-def render_pdf(html: str, output_path: str) -> None:
-    """Render HTML to PDF using Playwright's headless Chromium.
+def build_letter_html(text: str) -> str:
+    """Cover-letter template: escaped paragraphs in order, nothing dropped or reinterpreted."""
+    paras = [p.strip() for p in (text or "").replace("\r\n", "\n").split("\n\n") if p.strip()]
+    body = "\n".join("<p>" + _esc(p).replace("\n", "<br>") + "</p>" for p in paras)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+@page {{ size: letter; margin: 0.9in 1in; }}
+body {{ font-family: 'Calibri', 'Segoe UI', Arial, sans-serif; font-size: 11pt; line-height: 1.45; color: #1a1a1a; }}
+p {{ margin: 0 0 10pt 0; }}
+</style></head>
+<body>
+{body}
+</body></html>"""
 
-    Args:
-        html: Complete HTML string.
-        output_path: Path to write the PDF file.
+
+class RenderGuard:
+    """Records every request the rendering page attempts; all of them are aborted."""
+
+    def __init__(self) -> None:
+        self.attempted: list[str] = []
+
+    def handle(self, route) -> None:
+        self.attempted.append(route.request.url[:200])
+        route.abort()
+
+
+def render_pdf(html: str, output_path: str, guard: RenderGuard | None = None) -> None:
+    """Render HTML to PDF with Playwright's headless Chromium, offline and script-free.
+
+    JavaScript is disabled, the context is offline and every request (subresources, frames,
+    navigations) is aborted, so text in the document cannot fetch anything or run code.
+    The PDF is written next to ``output_path`` and moved into place only on success.
     """
     from playwright.sync_api import sync_playwright
 
+    guard = guard or RenderGuard()
+    out = Path(output_path)
+    tmp = out.with_name(out.name + ".partial")
+    tmp.unlink(missing_ok=True)
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
-        page.set_content(html, wait_until="networkidle")
-        page.pdf(
-            path=output_path,
-            format="Letter",
-            margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
-            print_background=True,
-        )
-        browser.close()
+        try:
+            context = browser.new_context(java_script_enabled=False, offline=True,
+                                          accept_downloads=False, service_workers="block")
+            context.route("**/*", guard.handle)
+            page = context.new_page()
+            page.set_content(html, wait_until="load")
+            page.pdf(
+                path=str(tmp),
+                format="Letter",
+                margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                print_background=True,
+            )
+        finally:
+            browser.close()
+    if guard.attempted:
+        log.warning("PDF render blocked %d request(s) from document content", len(guard.attempted))
+    os.replace(tmp, out)
 
 
 # ── Public API ───────────────────────────────────────────────────────────
 
+def _is_letter(text_path: Path) -> bool:
+    return text_path.stem.endswith("_CL")
+
+
 def convert_to_pdf(
-    text_path: Path, output_path: Path | None = None, html_only: bool = False
+    text_path: Path, output_path: Path | None = None, html_only: bool = False,
+    kind: str | None = None,
 ) -> Path:
     """Convert a text resume/cover letter to PDF.
 
@@ -367,14 +431,15 @@ def convert_to_pdf(
         output_path: Optional override for the output path. Defaults to same
             name with .pdf extension.
         html_only: If True, output HTML instead of PDF.
+        kind: "resume" or "cover"; defaults from the file name (``*_CL.txt`` = cover).
 
     Returns:
         Path to the generated PDF (or HTML) file.
     """
     text_path = Path(text_path)
     text = text_path.read_text(encoding="utf-8")
-    resume = parse_resume(text)
-    html = build_html(resume)
+    letter = (kind == "cover") if kind else _is_letter(text_path)
+    html = build_letter_html(text) if letter else build_html(parse_resume(text))
 
     if html_only:
         out = output_path or text_path.with_suffix(".html")
@@ -385,56 +450,52 @@ def convert_to_pdf(
 
     out = output_path or text_path.with_suffix(".pdf")
     out = Path(out)
+    out.unlink(missing_ok=True)  # never leave a PDF from older text behind a failed render
     render_pdf(html, str(out))
     log.info("PDF generated: %s", out)
     return out
 
 
+def render_job_document(conn, job: dict, kind: str) -> bool:
+    """Render the validated ``kind`` text of one job and bind the PDF to its hash."""
+    from applypilot.scoring import documents as D
+    path_c, val_c, sha_c, _pdf_c, _pdf_sha_c = D._cols(kind)
+    txt, sha = job.get(path_c), job.get(sha_c)
+    if not txt or not sha or job.get(val_c) != "passed" or D.sha_file(txt) != sha:
+        return False
+    pdf = convert_to_pdf(Path(txt), kind=kind)
+    return D.record_pdf(conn, job["url"], kind, txt, pdf, sha)
+
+
 def batch_convert(limit: int = 50) -> int:
-    """Convert .txt files in TAILORED_DIR that don't have corresponding PDFs.
+    """Render PDFs for validated documents whose PDF is missing or not bound to the current text.
 
-    Scans for .txt files (excluding _JOB.txt and _REPORT.json), checks if a
-    .pdf with the same stem already exists, and converts any that are missing.
-
-    Args:
-        limit: Maximum number of files to convert.
+    Driven by the database (not by scanning folders): only documents with a validation hash are
+    rendered, and the PDF is recorded only if the text still has that hash.
 
     Returns:
         Number of PDFs generated.
     """
-    if not TAILORED_DIR.exists():
-        log.warning("Tailored directory does not exist: %s", TAILORED_DIR)
-        return 0
+    from applypilot.database import get_connection
+    from applypilot.scoring import documents as D
 
-    txt_files = sorted(TAILORED_DIR.glob("*.txt"))
-    # Exclude _JOB.txt and _CL.txt files from resume conversion
-    # (they get their own conversion calls)
-    candidates = [
-        f for f in txt_files
-        if not f.name.endswith("_JOB.txt")
-    ]
-
-    # Filter to those without a corresponding PDF
-    to_convert: list[Path] = []
-    for f in candidates:
-        pdf_path = f.with_suffix(".pdf")
-        if not pdf_path.exists():
-            to_convert.append(f)
-        if len(to_convert) >= limit:
-            break
-
-    if not to_convert:
-        log.info("All text files already have PDFs.")
-        return 0
-
-    log.info("Converting %d files to PDF...", len(to_convert))
+    conn = get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM jobs WHERE (tailored_resume_path IS NOT NULL AND resume_sha IS NOT NULL) "
+        "OR (cover_letter_path IS NOT NULL AND cover_sha IS NOT NULL)").fetchall()]
     converted = 0
-    for f in to_convert:
-        try:
-            convert_to_pdf(f)
-            converted += 1
-        except Exception as e:
-            log.error("Failed to convert %s: %s", f.name, e)
-
-    log.info("Done: %d/%d PDFs generated in %s", converted, len(to_convert), TAILORED_DIR)
+    for job in rows:
+        for kind in D.KINDS:
+            if converted >= limit:
+                break
+            problems = D.artifact_problems(job, kind)
+            if not problems or not any("PDF" in p for p in problems):
+                continue
+            try:
+                if render_job_document(conn, job, kind):
+                    converted += 1
+            except Exception as e:  # noqa: BLE001 -- one failed render never stops the batch
+                log.error("Failed to render %s PDF for %s: %s", kind, job.get("title"), e)
+    conn.commit()
+    log.info("Done: %d PDFs generated in %s", converted, TAILORED_DIR)
     return converted

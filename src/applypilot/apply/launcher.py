@@ -195,6 +195,7 @@ def _select_target(conn, target_url: str, dry_run: bool = False):
         WHERE (j.url = ? OR (j.application_url = ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE url = ?)))
           AND j.tailored_resume_path IS NOT NULL
           AND (j.apply_status IS NULL OR j.apply_status IN ('failed', 'dry_run'))
+          AND j.applied_at IS NULL
           AND (j.apply_attempts IS NULL OR j.apply_attempts < ?)
           AND {_ELIGIBLE_CLAUSE}
           AND {_NO_DUPLICATE_CLAUSE}
@@ -222,6 +223,7 @@ def _select_next(conn, min_score: int, dry_run: bool):
         FROM jobs AS j
         WHERE j.tailored_resume_path IS NOT NULL
           AND (j.apply_status IS NULL OR j.apply_status IN {statuses})
+          AND j.applied_at IS NULL
           AND (j.apply_attempts IS NULL OR j.apply_attempts < ?)
           AND j.fit_score >= ?
           {site_clause}
@@ -286,6 +288,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                                last_attempted_at = ?
                 WHERE url = ?
                   AND (apply_status IS NULL OR apply_status IN ('failed', 'dry_run'))
+                  AND applied_at IS NULL
             """, (agent_id, datetime.now(timezone.utc).isoformat(), row["url"])).rowcount
             if claimed != 1:  # Defensive: the row changed under us.
                 conn.rollback()
@@ -510,49 +513,85 @@ def gen_prompt(target_url: str, min_score: int = 7,
     return prompt_file
 
 
-def mark_job(url: str, status: str, reason: str | None = None) -> None:
-    """Manually mark a job's apply status in the database.
+def mark_job(url: str, status: str, reason: str | None = None) -> tuple[bool, str]:
+    """Operator recovery: record a job as applied or failed (audit R8: transactional, checked).
 
-    Args:
-        url: Job URL to mark.
-        status: Either 'applied' or 'failed'.
-        reason: Failure reason (only for status='failed').
+    * A live ``in_progress`` claim is never changed (a worker may still be acting on it).
+    * Marking failed never erases an application: a row with ``applied_at`` stays applied.
+    * The change must hit exactly one row; every change is appended to ``application_events``.
+
+    Returns:
+        (changed, message)
     """
+    from applypilot.database import log_event
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
-            WHERE url = ?
-        """, (now, url))
-    else:
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
-            WHERE url = ?
-        """, (reason or "manual", url))
-    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT apply_status, applied_at FROM jobs WHERE url = ?", (url,)).fetchone()
+        if row is None:
+            conn.rollback()
+            return False, "no job with that exact URL"
+        if row["apply_status"] == "in_progress":
+            conn.rollback()
+            return False, "a worker currently holds this job; wait for it to finish (or for stale-claim recovery)"
+        if status == "applied":
+            cur = conn.execute("""
+                UPDATE jobs SET apply_status = 'applied', applied_at = COALESCE(applied_at, ?),
+                               apply_error = NULL, agent_id = NULL, verification_confidence = 'human_reported'
+                WHERE url = ? AND COALESCE(apply_status, '') != 'in_progress'
+            """, (now, url))
+        else:
+            if row["applied_at"] or row["apply_status"] == "applied":
+                conn.rollback()
+                return False, "an application is recorded for this job; it cannot be marked failed"
+            cur = conn.execute("""
+                UPDATE jobs SET apply_status = 'failed', apply_error = ?,
+                               apply_attempts = 99, agent_id = NULL
+                WHERE url = ? AND applied_at IS NULL AND COALESCE(apply_status, '') NOT IN ('in_progress', 'applied')
+            """, (reason or "manual", url))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "the job changed concurrently; nothing recorded"
+        log_event(conn, url, f"operator_mark_{status}", reason or "", actor="cli")
+        conn.commit()
+        return True, status
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def reset_failed() -> int:
     """Reset all failed jobs so they can be retried.
 
     Never touches applied, in-progress or needs-review jobs: a needs-review
-    job may already have been submitted and must be resolved by a human.
+    job may already have been submitted and must be resolved by a human. A row with
+    ``applied_at`` set is never reset, whatever its status says (audit R8).
 
     Returns:
         Number of jobs reset.
     """
+    from applypilot.database import log_event
     conn = get_connection()
-    cursor = conn.execute("""
-        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                       apply_attempts = 0, agent_id = NULL
-        WHERE apply_status IS NOT NULL
-          AND apply_status NOT IN ('applied', 'in_progress', 'needs_review')
-    """)
-    conn.commit()
-    return cursor.rowcount
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        urls = [r[0] for r in conn.execute("""
+            SELECT url FROM jobs WHERE apply_status IS NOT NULL AND applied_at IS NULL
+              AND apply_status NOT IN ('applied', 'in_progress', 'needs_review')""")]
+        cursor = conn.execute("""
+            UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                           apply_attempts = 0, agent_id = NULL
+            WHERE apply_status IS NOT NULL AND applied_at IS NULL
+              AND apply_status NOT IN ('applied', 'in_progress', 'needs_review')
+        """)
+        for u in urls:
+            log_event(conn, u, "operator_reset_failed", actor="cli")
+        conn.commit()
+        return cursor.rowcount
+    except BaseException:
+        conn.rollback()
+        raise
+
 
 
 # ---------------------------------------------------------------------------
@@ -1191,19 +1230,37 @@ def _is_permanent_failure(result: str) -> bool:
 # Worker loop
 # ---------------------------------------------------------------------------
 
-def _still_ready(job: dict) -> tuple[bool, list[str]]:
+def _still_ready(job: dict, dry_run: bool | None = None) -> tuple[bool, list[str]]:
+    """Re-evaluate a claimed job from its *current* row (audit R8).
+
+    Ready only if this worker still owns the in-progress claim, nothing has recorded an
+    application, the full readiness evaluation passes, and (for a real run) the human
+    approval still stands. Callers continue with ``fresh_job`` -- never the claim snapshot."""
     from applypilot import readiness
     conn = get_connection()
     row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job["url"],)).fetchone()
     if row is None:
         return False, ["job row disappeared"]
-    _ok, reasons, _ = readiness.evaluate(dict(row), conn)
-    # In flight because *we* just claimed it -- that alone is not a blocker.
-    reasons = [r for r in reasons if r != "application history: status is in_progress"]
+    current = dict(row)
+    if dry_run is None:
+        dry_run = str(job.get("agent_id") or "").endswith(DRY_RUN_AGENT_SUFFIX)
+    ownership: list[str] = []
+    if current.get("apply_status") != "in_progress" or current.get("agent_id") != job.get("agent_id"):
+        ownership.append("claim no longer held by this worker")
+    if current.get("applied_at"):
+        ownership.append("an application is already recorded for this job")
+    if not dry_run and current.get("review_status") != "approved":
+        ownership.append(f"human approval no longer stands ({current.get('review_status') or 'none'})")
+    _ok, reasons, _ = readiness.evaluate(current, conn)
+    # In flight because *we* hold the claim (checked above) -- that alone is not a blocker.
+    reasons = ownership + [r for r in reasons if r != "application history: status is in_progress"]
     if reasons:
         conn.execute("UPDATE jobs SET readiness = 'blocked', readiness_reasons = ? WHERE url = ?",
                      (json.dumps(reasons), job["url"]))
         conn.commit()
+    else:
+        job.clear()
+        job.update(current)  # continue with the row that was just evaluated
     return not reasons, reasons
 
 
@@ -1278,17 +1335,18 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         with _claude_lock:
             _agent_started.discard(worker_id)
 
-        # Fresh readiness check after the claim (posting, documents, duplicates, history).
-        ready_ok, ready_reasons = _still_ready(job)
-        if not ready_ok:
-            add_event(f"[W{worker_id}] Not ready, released: {'; '.join(ready_reasons)[:60]}")
-            release_lock(job["url"], owner=job["agent_id"])
-            jobs_done += 1
-            continue
-
         chrome_proc = None
         guard = None
         try:
+            # Fresh readiness check after the claim (ownership, approval, posting, documents,
+            # duplicates, history), inside the release/exception block.
+            ready_ok, ready_reasons = _still_ready(job, dry_run)
+            if not ready_ok:
+                add_event(f"[W{worker_id}] Not ready, released: {'; '.join(ready_reasons)[:60]}")
+                release_lock(job["url"], owner=job["agent_id"])
+                jobs_done += 1
+                continue
+
             # The network guard (egress proxy) exists before Chrome, so Chrome never has a direct route.
             guard = NetworkGuard()
             add_event(f"[W{worker_id}] Launching Chrome...")

@@ -16,22 +16,32 @@ Outcomes (``jobs.posting_status``):
 
 Only ``active`` (recent enough, see ``is_fresh``) lets a job become application-ready.
 The official employer / ATS URL (``application_url``) is preferred over job-board URLs.
+
+Network trust boundary (audit R3): every request -- the posting, each redirect hop and
+robots.txt -- goes through ``safe_fetch``: http(s) only, no credentials in the URL, ports
+80/443 only, every resolved address must be public (no loopback, private, link-local,
+multicast or reserved ranges), and the connection dials the exact address that was checked.
+Redirects are followed manually (at most ``MAX_REDIRECTS``), each hop re-checked and subject
+to robots.txt. A verification records the URL actually reached and is bound to the URL checked.
 """
 from __future__ import annotations
 
+import http.client
+import ipaddress
 import logging
 import re
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 import urllib.error
-import urllib.request
 import urllib.robotparser
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import unescape
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from applypilot import opsconfig
 from applypilot.database import get_connection
@@ -69,23 +79,118 @@ class CheckResult:
     reason: str
     http_status: int | None = None
     checked_url: str = ""
+    final_url: str = ""
 
 
 Fetcher = Callable[[str, float], tuple[int, str, str]]  # (status, final_url, text)
 
+MAX_REDIRECTS = 5
+ALLOWED_PORTS = (80, 443)
+_LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet", ".corp")
+
+
+class UnsafeDestination(ValueError):
+    """The URL (or a redirect hop) is outside the public-destination policy."""
+
+
+def resolve_host(host: str, port: int) -> list[str]:
+    return sorted({ai[4][0] for ai in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+
+
+def is_public_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
+
+
+def check_destination(url: str, *, resolve: Callable[[str, int], list[str]] = resolve_host,
+                      is_public: Callable[[str], bool] = is_public_ip,
+                      ports: tuple[int, ...] = ALLOWED_PORTS) -> list[str]:
+    """Addresses this URL may be fetched from; raises UnsafeDestination otherwise."""
+    p = urlsplit(url)
+    if p.scheme not in ("http", "https"):
+        raise UnsafeDestination(f"scheme '{p.scheme}' not allowed")
+    if p.username is not None or p.password is not None or "@" in p.netloc:
+        raise UnsafeDestination("credentials in URL")
+    try:
+        port = p.port or (443 if p.scheme == "https" else 80)
+    except ValueError as e:
+        raise UnsafeDestination("invalid port") from e
+    if port not in ports:
+        raise UnsafeDestination(f"port {port} not allowed")
+    host = (p.hostname or "").rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
+        raise UnsafeDestination("non-public host name")
+    try:
+        addrs = resolve(host, port)
+    except OSError as e:
+        raise UnsafeDestination(f"DNS resolution failed ({type(e).__name__})") from e
+    if not addrs:
+        raise UnsafeDestination("host does not resolve")
+    if any(not is_public(a) for a in addrs):
+        raise UnsafeDestination("host resolves to a non-public address")
+    return addrs
+
+
+class _PinnedHTTP(http.client.HTTPConnection):
+    def __init__(self, host: str, ip: str, port: int, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._ip = ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._ip, self.port), self.timeout)
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    def __init__(self, host: str, ip: str, port: int, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._ip = ip
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)  # certificate checked for host
+
+
+def safe_fetch(url: str, timeout: float, *, resolve: Callable[[str, int], list[str]] = resolve_host,
+               is_public: Callable[[str], bool] = is_public_ip, ports: tuple[int, ...] = ALLOWED_PORTS,
+               hop_allowed: Callable[[str], bool] | None = None) -> tuple[int, str, str]:
+    """GET with the public-destination policy on every hop; returns (status, final_url, text).
+
+    The socket dials the exact address that passed the check (pinned), so DNS cannot change
+    between the check and the connection; TLS still verifies the certificate for the host name."""
+    for hop in range(MAX_REDIRECTS + 1):
+        addrs = check_destination(url, resolve=resolve, is_public=is_public, ports=ports)
+        if hop and hop_allowed is not None and not hop_allowed(url):
+            raise UnsafeDestination("robots.txt disallows a redirect target")
+        p = urlsplit(url)
+        port = p.port or (443 if p.scheme == "https" else 80)
+        cls = _PinnedHTTPS if p.scheme == "https" else _PinnedHTTP
+        conn = cls(p.hostname or "", addrs[0], port, timeout)
+        try:
+            target = (p.path or "/") + (f"?{p.query}" if p.query else "")
+            conn.request("GET", target, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.5",
+                                                 "Accept-Encoding": "identity"})
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                if not loc:
+                    return resp.status, url, ""
+                url = urljoin(url, loc)
+                continue
+            body = resp.read(MAX_BYTES).decode(resp.headers.get_content_charset() or "utf-8", "replace")
+            return resp.status, url, body
+        finally:
+            conn.close()
+    raise UnsafeDestination(f"more than {MAX_REDIRECTS} redirects")
+
 
 def http_fetch(url: str, timeout: float) -> tuple[int, str, str]:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.5"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # http(s) only (checked by caller)
-            body = resp.read(MAX_BYTES).decode(resp.headers.get_content_charset() or "utf-8", "replace")
-            return resp.status, resp.geturl(), body
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read(200_000).decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            body = ""
-        return e.code, url, body
+    """Default fetcher: ``safe_fetch`` with the production policy."""
+    return safe_fetch(url, timeout)
 
 
 class RobotsCache:
@@ -134,12 +239,30 @@ def _title_tokens(title: str) -> set[str]:
     return {t for t in re.findall(r"[a-z0-9+#]+", (title or "").lower()) if t not in _STOP and len(t) > 1}
 
 
+_ATS_SUFFIXES = ("myworkdayjobs.com", "icims.com", "taleo.net", "successfactors.com", "oraclecloud.com",
+                 "ultipro.com", "paylocity.com", "jobvite.com", "smartrecruiters.com")
+
+
+def _site_key(host: str) -> str:
+    """Same-site key: the ATS tenant (first label) on shared ATS domains, else the last two labels."""
+    host = (host or "").lower().rstrip(".")
+    for ats in _ATS_SUFFIXES:
+        if host == ats or host.endswith("." + ats):
+            return host.split(".")[0] + "@" + ats
+    return ".".join(host.split(".")[-2:])
+
+
 def page_text(html: str) -> str:
     return re.sub(r"\s+", " ", unescape(_TAG_RE.sub(" ", html or "")))
 
 
-def classify_response(status: int, final_url: str, html: str, title: str) -> tuple[str, str]:
-    """Pure decision for one fetched page."""
+def classify_response(status: int, final_url: str, html: str, title: str, requested_url: str = "",
+                      requisition_id: str | None = None) -> tuple[str, str]:
+    """Pure decision for one fetched page.
+
+    ``active`` needs: the page reached is on the same site (or ATS tenant) as the posting URL,
+    nearly every title word appears as a whole word, and a known requisition ID appears on the
+    page or in the final URL. Anything weaker is ``uncertain`` (manual review)."""
     if status in (404, 410):
         return "removed", f"HTTP {status}"
     if status in (401, 403, 407, 429) or status >= 500:
@@ -152,16 +275,25 @@ def classify_response(status: int, final_url: str, html: str, title: str) -> tup
         return "closed", f"page says: '{m.group(0)[:80]}'"
     if WALL_MARKERS.search(text) and len(text) < 20000:
         return "inaccessible", "bot/login wall (not bypassed)"
+    if requested_url and final_url:
+        want = urlsplit(requested_url).hostname or ""
+        got = urlsplit(urljoin(requested_url, final_url)).hostname or ""
+        if _site_key(want) != _site_key(got):
+            return "uncertain", f"redirected to another site ({got[:60]})"
     tokens = _title_tokens(title)
     if not tokens:
         return "uncertain", "job title unknown; cannot match the page"
     hay = text.lower()
-    found = {t for t in tokens if t in hay}
-    if len(found) >= max(1, (len(tokens) + 1) // 2):
-        return "active", f"page names the job ({len(found)}/{len(tokens)} title words)"
-    if len(text) < 500:
-        return "uncertain", "page content is script-rendered; cannot confirm the posting"
-    return "uncertain", "page does not mention this job (possibly redirected to a generic page)"
+    found = {t for t in tokens if re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", hay)}
+    need = len(tokens) if len(tokens) <= 3 else -(-len(tokens) * 3 // 4)
+    if len(found) < need:
+        if len(text) < 500:
+            return "uncertain", "page content is script-rendered; cannot confirm the posting"
+        return "uncertain", f"page does not clearly name this job ({len(found)}/{len(tokens)} title words)"
+    req = (requisition_id or "").strip()
+    if req and req.lower() not in hay and req.lower() not in (final_url or "").lower():
+        return "uncertain", f"requisition {req[:30]} not found on the page"
+    return "active", f"page names the job ({len(found)}/{len(tokens)} title words)"
 
 
 def preferred_url(job: dict) -> str:
@@ -182,12 +314,18 @@ def check_posting(job: dict, *, fetch: Fetcher = http_fetch, robots: RobotsCache
         return CheckResult("inaccessible", "robots.txt disallows automated checks", None, url)
     if throttle is not None:
         throttle.wait(url)
+    if fetch is http_fetch and robots is not None:
+        def fetch(u, t, _r=robots):  # every redirect hop is also subject to robots.txt
+            return safe_fetch(u, t, hop_allowed=_r.allowed)
     try:
         status, final_url, html = fetch(url, timeout)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+    except UnsafeDestination as e:
+        return CheckResult("inaccessible", f"unsafe destination: {e}", None, url)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException) as e:
         return CheckResult("inaccessible", f"fetch failed: {type(e).__name__}", None, url)
-    st, reason = classify_response(status, final_url, html, job.get("title") or "")
-    return CheckResult(st, reason, status, url)
+    st, reason = classify_response(status, final_url, html, job.get("title") or "", requested_url=url,
+                                   requisition_id=job.get("requisition_id"))
+    return CheckResult(st, reason, status, url, final_url or url)
 
 
 # --- freshness -----------------------------------------------------------------------------------
@@ -198,6 +336,8 @@ def is_fresh(job: dict, cfg: dict | None = None, now: datetime | None = None) ->
     max_days = float(cfg["freshness_max_days"])
     if job.get("posting_status") != "active":
         return False, f"posting not verified active ({job.get('posting_status') or 'never checked'})"
+    if (job.get("posting_verified_url") or "") != preferred_url(job):
+        return False, "posting verification was for a different URL; re-run verify"
     checked = age_days(job.get("posting_checked_at"), now)
     if checked is None or checked * 24 > float(cfg["verify_max_age_hours"]):
         return False, "posting verification is stale; re-run verify"
@@ -246,9 +386,10 @@ def run_verification(limit: int | None = None, conn: sqlite3.Connection | None =
             res = CheckResult("inaccessible", f"checker error: {type(e).__name__}", None, preferred_url(job))
         counts[res.status] = counts.get(res.status, 0) + 1
         conn.execute("UPDATE jobs SET posting_status = ?, posting_reason = ?, posting_http_status = ?,"
-                     " posting_checked_at = ?, posting_verified_url = ? WHERE url = ?",
+                     " posting_checked_at = ?, posting_verified_url = ?, posting_final_url = ? WHERE url = ?",
                      (res.status, res.reason[:300], res.http_status, datetime.now(UTC).isoformat(),
-                      res.checked_url[:1000], job["url"]))
+                      res.checked_url[:1000], (res.final_url or "")[:1000] or None, job["url"]))
+
         conn.commit()
     log.info("verify: %d checked %s", len(rows), counts)
     return {"status": "ok", "checked": len(rows), **counts}

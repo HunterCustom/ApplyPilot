@@ -61,14 +61,16 @@ def _parse_score_response(response: str) -> dict:
     keywords = ""
     reasoning = response
 
+    # Exactly one structured score, in range, on its own line (audit R11): conflicting or
+    # out-of-range values are never clamped into a valid score.
+    score_lines = [ln.strip() for ln in response.split("\n") if re.match(r"\s*\**\s*SCORE\s*\**\s*:", ln, re.IGNORECASE)]
+    if len(score_lines) == 1:
+        m = re.fullmatch(r"\**\s*SCORE\s*\**\s*:\s*\**\s*(10|[1-9])\s*\**", score_lines[0], re.IGNORECASE)
+        score = int(m.group(1)) if m else 0
     for line in response.split("\n"):
         line = line.strip()
         if line.startswith("SCORE:"):
-            try:
-                score = int(re.search(r"\d+", line).group())
-                score = max(1, min(10, score))
-            except (AttributeError, ValueError):
-                score = 0
+            continue
         elif line.startswith("KEYWORDS:"):
             keywords = line.replace("KEYWORDS:", "").strip()
         elif line.startswith("REASONING:"):
@@ -81,14 +83,18 @@ SCORE_PROMPT_VERSION = "2"  # bump when SCORE_PROMPT or the parse rules change (
 SCORE_TEMPERATURE = 0.2
 
 
-def score_config(evidence_text: str) -> dict:
-    """What produced a score: recorded with it for traceability (model is recorded separately)."""
+def score_config(evidence_text: str, resume_text: str = "") -> dict:
+    """What produced a score: recorded with it for traceability (model is recorded separately).
+
+    ``evidence_sha`` / ``resume_sha`` identify the exact candidate evidence and resume versions."""
     import hashlib
     return {"prompt_version": SCORE_PROMPT_VERSION,
             "prompt_sha": hashlib.sha256(SCORE_PROMPT.encode()).hexdigest()[:12],
             "temperature": SCORE_TEMPERATURE,
             "max_tokens": max(256, int(os.environ.get("APPLYPILOT_SCORE_MAX_TOKENS", "2048"))),
-            "evidence": bool(evidence_text)}
+            "evidence": bool(evidence_text),
+            "evidence_sha": hashlib.sha256(evidence_text.encode("utf-8")).hexdigest()[:16] if evidence_text else None,
+            "resume_sha": hashlib.sha256(resume_text.encode("utf-8")).hexdigest()[:16] if resume_text else None}
 
 
 def score_job(resume_text: str, job: dict, evidence_text: str = "") -> dict:
@@ -120,6 +126,8 @@ def score_job(resume_text: str, job: dict, evidence_text: str = "") -> dict:
                 raise ValueError("Empty LLM response")
             if not re.search(r"(?im)^\s*SCORE:\s*(?:10|[1-9])\s*$", response):
                 raise ValueError("Missing or invalid SCORE field")
+            if len(re.findall(r"(?im)^\s*\**\s*SCORE\s*\**\s*:", response)) != 1:
+                raise ValueError("More than one SCORE field (conflicting output)")
             if not re.search(r"(?im)^\s*REASONING:\s*\S", response):
                 raise ValueError("Missing REASONING field")
             parsed = _parse_score_response(response)
@@ -151,9 +159,12 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         log.info("Eligibility classified %d jobs: %s", sum(classified.values()), classified)
 
     if rescore:
-        query = f"SELECT * FROM jobs WHERE full_description IS NOT NULL AND {SQL_NOT_INELIGIBLE}"
+        # Same filters as ordinary selection (audit R11), except that scored rows are included;
+        # the previous score is preserved in score_history before it is replaced.
+        query = (f"SELECT * FROM jobs WHERE full_description IS NOT NULL AND {SQL_NOT_INELIGIBLE}"
+                 " AND duplicate_of IS NULL AND (posting_status IS NULL OR posting_status NOT IN ('closed', 'removed'))")
         if limit > 0:
-            query += f" LIMIT {limit}"
+            query += f" LIMIT {int(limit)}"
         jobs = conn.execute(query).fetchall()
     else:
         # Load all candidates before limiting, so ranking applies globally.
@@ -185,7 +196,8 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         model = get_client().model
     except Exception:  # noqa: BLE001 -- recorded as unknown, scoring itself reports LLM errors
         model = "unknown"
-    cfg_json = json.dumps(score_config(evidence_text), sort_keys=True)
+    cfg_json = json.dumps(score_config(evidence_text, resume_text), sort_keys=True)
+
     for index, job in enumerate(jobs, start=1):
         result = score_job(resume_text, job, evidence_text)
         if result["score"] == 0:

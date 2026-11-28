@@ -5,8 +5,8 @@ how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
 
+import hashlib
 import logging
-import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -203,42 +203,43 @@ def build_prompt(job: dict, tailored_resume: str,
     search_config = config.load_search_config()
     personal = profile["personal"]
 
-    # --- Resolve resume PDF path ---
-    resume_path = job.get("tailored_resume_path")
-    if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
+    # --- Documents: only the exact, hash-verified artifacts (audit R1) ---
+    from applypilot.scoring import documents as D
+    problems = D.artifact_problems(job, "resume")
+    if problems:
+        raise ValueError(f"Resume not usable for {job.get('title', 'unknown')}: {problems[0]}")
+    if cover_letter:
+        raise ValueError("free-text cover letters are not accepted; only validated cover letter artifacts")
+    resume_bytes = Path(job["tailored_resume_path"]).read_bytes()
+    if hashlib.sha256(resume_bytes).hexdigest() != job["resume_sha"]:
+        raise ValueError("resume text changed after validation; refusing to use it")
+    tailored_resume = resume_bytes.decode("utf-8").replace("\r\n", "\n")  # the agent sees exactly the validated text
 
-    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
-    if not src_pdf.exists():
-        raise ValueError(f"Resume PDF not found: {src_pdf}")
-
-    # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
     name_slug = full_name.replace(" ", "_")
     dest_dir = Path(upload_dir) if upload_dir else config.APPLY_WORKER_DIR / "current"
     dest_dir.mkdir(parents=True, exist_ok=True)
-    upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
-    shutil.copy(str(src_pdf), str(upload_pdf))
-    pdf_path = str(upload_pdf)
 
-    # --- Cover letter handling ---
-    cover_letter_text = cover_letter or ""
+    def _copy_verified(src: str, expected_sha: str, dest: Path) -> str:
+        data = Path(src).read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected_sha:
+            raise ValueError("document changed after validation; refusing to upload it")
+        dest.write_bytes(data)
+        return str(dest)
+
+    # Copy to a clean filename for upload (recruiters see the filename); the copy is the verified bytes.
+    pdf_path = _copy_verified(job["resume_pdf_path"], job["resume_pdf_sha"], dest_dir / f"{name_slug}_Resume.pdf")
+
+    # A cover letter is offered only when it is a fully verified artifact; otherwise none exists.
+    cover_letter_text = ""
     cl_upload_path = ""
-    cl_path = job.get("cover_letter_path")
-    if cl_path and Path(cl_path).exists():
-        cl_src = Path(cl_path)
-        # Read text from .txt sibling (PDF is binary)
-        cl_txt = cl_src.with_suffix(".txt")
-        if cl_txt.exists():
-            cover_letter_text = cl_txt.read_text(encoding="utf-8")
-        elif cl_src.suffix == ".txt":
-            cover_letter_text = cl_src.read_text(encoding="utf-8")
-        # Upload must be PDF
-        cl_pdf_src = cl_src.with_suffix(".pdf")
-        if cl_pdf_src.exists():
-            cl_upload = dest_dir / f"{name_slug}_Cover_Letter.pdf"
-            shutil.copy(str(cl_pdf_src), str(cl_upload))
-            cl_upload_path = str(cl_upload)
+    if D.cover_usable(job):
+        cl_bytes = Path(job["cover_letter_path"]).read_bytes()
+        if hashlib.sha256(cl_bytes).hexdigest() != job["cover_sha"]:
+            raise ValueError("cover letter changed after validation; refusing to use it")
+        cover_letter_text = cl_bytes.decode("utf-8").replace("\r\n", "\n")
+        cl_upload_path = _copy_verified(job["cover_pdf_path"], job["cover_pdf_sha"],
+                                        dest_dir / f"{name_slug}_Cover_Letter.pdf")
 
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
@@ -248,16 +249,15 @@ def build_prompt(job: dict, tailored_resume: str,
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
 
-    # Cover letter fallback text
-    city = personal.get("city", "the area")
+    # Cover letter: never composed by the agent (it would bypass document validation).
     if not cover_letter_text:
         cl_display = (
-            f"None available. Skip if optional. If required, write 2 factual "
-            f"sentences: (1) relevant experience from the resume that matches "
-            f"this role, (2) available immediately and based in {city}."
+            "None available. Leave optional cover letter fields empty. If the form REQUIRES a "
+            "cover letter, do not write one: output RESULT:FAILED:needs_human_answer and stop."
         )
     else:
         cl_display = cover_letter_text
+
 
     # Phone digits only (for fields with country prefix)
     phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())

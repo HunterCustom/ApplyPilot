@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
-from pathlib import Path
 
 from applypilot import config, eligibility, opsconfig, screening
 from applypilot.database import get_connection
@@ -64,6 +63,9 @@ def evaluate(job: dict, conn: sqlite3.Connection | None = None, cfg: dict | None
     if status not in eligibility.ELIGIBLE_STATUSES or version not in (eligibility.CLASSIFIER_VERSION,
                                                                        eligibility.MANUAL_VERSION):
         reasons.append(f"eligibility not verified ({status or 'unclassified'})")
+    elif not eligibility.decision_is_current(job):
+        reasons.append("eligibility decision is stale (posting text, location, URL or rules changed); reclassify")
+
 
     score = job.get("fit_score")
     if score is None or score < int(cfg["min_score"]):
@@ -91,22 +93,31 @@ def evaluate(job: dict, conn: sqlite3.Connection | None = None, cfg: dict | None
                     reasons.append(f"already applied to this role at this employer {days:.0f} days ago")
                     break
 
-    path = job.get("tailored_resume_path")
-    if not path or job.get("resume_validation") != "passed":
-        reasons.append("no validated tailored resume" + (f" ({job.get('resume_validation')})"
-                                                          if job.get("resume_validation") else ""))
-    elif not Path(path).exists():
-        reasons.append("tailored resume file is missing")
-    else:
-        from applypilot.scoring.documents import fingerprint
-        if job.get("documents_for") != fingerprint(job, profile if profile is not None else config.load_profile()):
-            reasons.append("documents are stale (job text, resume, profile or evidence changed)")
-    if cfg.get("require_cover_letter"):
-        cl = job.get("cover_letter_path")
-        if not cl or job.get("cover_validation") != "passed":
-            reasons.append("no validated cover letter")
-        elif not Path(cl).exists():
-            reasons.append("cover letter file is missing")
+    # Documents: the exact validated bytes (text + the PDF rendered from it), built from the
+    # current inputs. Any change, missing file or unbound PDF fails closed (audit R1).
+    from applypilot.scoring import documents as D
+    current = D.fingerprint(job, profile if profile is not None else config.load_profile())
+    resume_problems = D.artifact_problems(job, "resume")
+    reasons += resume_problems
+    if (job.get("tailored_resume_path") and job.get("resume_validation") == "passed"
+            and job.get("documents_for") != current):
+
+        reasons.append("documents are stale (job text, resume, profile or evidence changed)")
+    cover_problems = D.artifact_problems(job, "cover")
+    info["cover_letter"] = "verified" if not cover_problems else "omitted (" + cover_problems[0] + ")"
+    if not cover_problems and job.get("cover_for") != current:
+        cover_problems = ["cover letter is stale (built from other inputs)"]
+        info["cover_letter"] = "omitted (stale)"
+    if cfg.get("require_cover_letter") and cover_problems:
+        reasons += cover_problems
+    # A human approval covers exactly the artifacts that were reviewed.
+    if job.get("review_status") == "approved":
+        try:
+            approved_manifest = json.loads(job.get("review_artifacts") or "null")
+        except ValueError:
+            approved_manifest = None
+        if approved_manifest != D.manifest(job):
+            reasons.append("documents changed since human approval (review again)")
 
     try:
         cov = screening.coverage()
@@ -130,12 +141,17 @@ def run_prepare(conn: sqlite3.Connection | None = None, cfg: dict | None = None)
     for row in conn.execute(_CANDIDATES).fetchall():
         job = dict(row)
         ok, reasons, info = evaluate(job, conn, cfg, profile=profile)
-        if any(r.startswith("documents are stale") for r in reasons):
+        if any(r.startswith(("documents are stale", "cover letter is stale")) for r in reasons):
             # The old files stay on disk (recorded as rejected=stale); tailor/cover regenerate them.
-            conn.execute("UPDATE jobs SET resume_rejected_path = tailored_resume_path, tailored_resume_path = NULL,"
-                         " resume_validation = 'stale', cover_rejected_path = COALESCE(cover_letter_path,"
-                         " cover_rejected_path), cover_letter_path = NULL, cover_validation = NULL,"
-                         " tailor_attempts = 0, cover_attempts = 0 WHERE url = ?", (job["url"],))
+            resume_too = any(r.startswith("documents are stale") for r in reasons)
+            if resume_too:
+                conn.execute("UPDATE jobs SET resume_rejected_path = tailored_resume_path, tailored_resume_path = NULL,"
+                             " resume_validation = 'stale', resume_sha = NULL, resume_pdf_path = NULL,"
+                             " resume_pdf_sha = NULL, tailor_attempts = 0 WHERE url = ?", (job["url"],))
+            conn.execute("UPDATE jobs SET cover_rejected_path = COALESCE(cover_letter_path, cover_rejected_path),"
+                         " cover_letter_path = NULL, cover_validation = NULL, cover_sha = NULL, cover_pdf_path = NULL,"
+                         " cover_pdf_sha = NULL, cover_for = NULL, cover_attempts = 0, review_artifacts = NULL"
+                         " WHERE url = ?", (job["url"],))
             stale += 1
         screening_status = "supported" if not info.get("screening_missing") else "needs_review"
         conn.execute("UPDATE jobs SET readiness = ?, readiness_reasons = ?, readiness_at = ?, screening_status = ?,"
@@ -148,7 +164,7 @@ def run_prepare(conn: sqlite3.Connection | None = None, cfg: dict | None = None)
             blocked += 1
         # A human approval is void once the job is no longer ready.
         if not ok and job.get("review_status") == "approved":
-            conn.execute("UPDATE jobs SET review_status = NULL, review_note = ? WHERE url = ?",
+            conn.execute("UPDATE jobs SET review_status = NULL, review_artifacts = NULL, review_note = ? WHERE url = ?",
                          ("approval withdrawn: " + "; ".join(reasons)[:200], job["url"]))
     conn.commit()
     return {"status": "ok", "ready": ready, "blocked": blocked, "stale": stale}
@@ -168,29 +184,42 @@ def review(url: str, action: str, note: str = "", conn: sqlite3.Connection | Non
     if job is None:
         return False, "no job with that exact URL"
     if action == "approve":
-        ok, reasons, _ = evaluate(job, conn)
+        pending = dict(job, review_status=None)  # readiness before this decision
+        ok, reasons, _ = evaluate(pending, conn)
         if not ok:
             return False, "not ready: " + "; ".join(reasons)
-        conn.execute("UPDATE jobs SET review_status = 'approved', review_note = ?, reviewed_at = ?, readiness = 'ready'"
-                     " WHERE url = ?", (note[:500], _now(), url))
+        from applypilot.scoring import documents as D
+        conn.execute("UPDATE jobs SET review_status = 'approved', review_note = ?, reviewed_at = ?, readiness = 'ready',"
+                     " review_artifacts = ? WHERE url = ?",
+                     (note[:500], _now(), json.dumps(D.manifest(job)), url))
+
     elif action in ("reject", "defer"):
-        conn.execute("UPDATE jobs SET review_status = ?, review_note = ?, reviewed_at = ? WHERE url = ?",
-                     ("rejected" if action == "reject" else "deferred", note[:500], _now(), url))
+        conn.execute("UPDATE jobs SET review_status = ?, review_note = ?, reviewed_at = ?, review_artifacts = NULL"
+                     " WHERE url = ?", ("rejected" if action == "reject" else "deferred", note[:500], _now(), url))
     elif action == "manual_submitted":
-        if job.get("apply_status") == "applied":
+        if job.get("apply_status") == "applied" or job.get("applied_at"):
             return False, "already recorded as applied"
+        if job.get("apply_status") == "in_progress":
+            return False, "a worker currently holds this job; wait for it to finish before recording a manual submission"
         # The candidate applied by hand: record it so no automated or duplicate application follows.
-        conn.execute("UPDATE jobs SET review_status = 'manual_submitted', review_note = ?, reviewed_at = ?,"
-                     " apply_status = 'applied', applied_at = ?, verification_confidence = 'human_reported',"
-                     " apply_error = NULL WHERE url = ? AND (apply_status IS NULL OR apply_status NOT IN"
-                     " ('in_progress'))", (note[:500], _now(), _now(), url))
+        cur = conn.execute("UPDATE jobs SET review_status = 'manual_submitted', review_note = ?, reviewed_at = ?,"
+                           " apply_status = 'applied', applied_at = ?, verification_confidence = 'human_reported',"
+                           " apply_error = NULL WHERE url = ? AND applied_at IS NULL AND"
+                           " COALESCE(apply_status, '') NOT IN ('in_progress', 'applied')",
+                           (note[:500], _now(), _now(), url))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "the job changed concurrently; nothing recorded"
     elif action == "reset":
-        conn.execute("UPDATE jobs SET review_status = NULL, review_note = ?, reviewed_at = ? WHERE url = ?",
-                     (note[:500], _now(), url))
+        conn.execute("UPDATE jobs SET review_status = NULL, review_note = ?, reviewed_at = ?, review_artifacts = NULL"
+                     " WHERE url = ?", (note[:500], _now(), url))
     else:
         return False, f"unknown action {action!r}"
+    from applypilot.database import log_event
+    log_event(conn, url, f"review_{action}", note, actor="cli")
     conn.commit()
     return True, action
+
 
 
 def queue(conn: sqlite3.Connection | None = None, status: str = "ready", limit: int = 50) -> list[dict]:

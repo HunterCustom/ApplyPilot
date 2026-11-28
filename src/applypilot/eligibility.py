@@ -456,8 +456,31 @@ def load_eligibility_config(search_cfg: dict | None = None, profile: dict | None
 
 # ---- persistence ----------------------------------------------------------
 
+def input_hash(job: dict, cfg: EligibilityConfig | None = None) -> str:
+    """Hash of everything a decision depends on (audit R3: a decision is bound to its inputs).
+
+    ``cfg=None`` hashes only the job text -- used for human decisions, which do not depend on
+    the classifier configuration but must be revisited when the posting text changes."""
+    import hashlib
+    parts = [str(job.get(k) or "") for k in ("title", "location", "full_description", "application_url")]
+    if cfg is not None:
+        parts.append(repr((cfg.home_state, sorted((k, tuple(v)) for k, v in cfg.tiers.items()), cfg.other_nc,
+                           sorted(cfg.aliases.items()), CLASSIFIER_VERSION)))
+    return hashlib.sha256("\x00".join(parts).encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def decision_is_current(job: dict, cfg: EligibilityConfig | None = None) -> bool:
+    """True if the stored eligibility decision was made from the job's current inputs."""
+    if job.get("eligibility_version") == MANUAL_VERSION:
+        return job.get("eligibility_input") == input_hash(job)
+    if job.get("eligibility_version") != CLASSIFIER_VERSION:
+        return False
+    return job.get("eligibility_input") == input_hash(job, cfg or load_eligibility_config())
+
+
 def classify_jobs(conn=None, cfg: EligibilityConfig | None = None, force: bool = False) -> dict:
-    """Classify enriched jobs that are unclassified or classified by an older version.
+    """Classify enriched jobs that are unclassified, classified by an older version, or whose
+    inputs (posting text, location, application URL, eligibility config) changed since.
 
     Human decisions (version 'manual') are never overwritten. Never deletes rows.
     Returns {status: count} for the rows (re)classified in this call.
@@ -468,21 +491,23 @@ def classify_jobs(conn=None, cfg: EligibilityConfig | None = None, force: bool =
     where = "(full_description IS NOT NULL OR detail_scraped_at IS NOT NULL)"
     where += " AND COALESCE(eligibility_version, '') != ?"
     params: list = [MANUAL_VERSION]
-    if not force:
-        where += " AND COALESCE(eligibility_version, '') != ?"
-        params.append(CLASSIFIER_VERSION)
     rows = conn.execute(
-        f"SELECT url, title, location, full_description, application_url FROM jobs WHERE {where}", params
+        f"SELECT url, title, location, full_description, application_url, eligibility_version, eligibility_input"
+        f" FROM jobs WHERE {where}", params
     ).fetchall()
     now = datetime.now(UTC).isoformat()
     counts: dict[str, int] = {}
     for row in rows:
-        e = classify(dict(row), cfg)
+        job = dict(row)
+        h = input_hash(job, cfg)
+        if not force and job.get("eligibility_version") == CLASSIFIER_VERSION and job.get("eligibility_input") == h:
+            continue
+        e = classify(job, cfg)
         conn.execute("""
             UPDATE jobs SET eligibility_status = ?, eligibility_reason = ?, eligibility_evidence = ?,
-                           eligibility_tier = ?, eligibility_version = ?, eligibility_at = ?
-            WHERE url = ?
-        """, (e.status, e.reason, e.evidence_json(), e.tier, e.version, now, row["url"]))
+                           eligibility_tier = ?, eligibility_version = ?, eligibility_at = ?, eligibility_input = ?
+            WHERE url = ? AND COALESCE(eligibility_version, '') != ?
+        """, (e.status, e.reason, e.evidence_json(), e.tier, e.version, now, h, job["url"], MANUAL_VERSION))
         counts[e.status] = counts.get(e.status, 0) + 1
     conn.commit()
     return counts
@@ -493,11 +518,16 @@ def set_manual_decision(url: str, approve: bool, note: str = "", conn=None) -> b
     from applypilot.database import get_connection
     conn = conn or get_connection()
     status = "eligible_manual" if approve else "ineligible_manual"
+    row = conn.execute("SELECT title, location, full_description, application_url FROM jobs WHERE url = ?",
+                       (url,)).fetchone()
+    if row is None:
+        return False
     cur = conn.execute("""
         UPDATE jobs SET eligibility_status = ?, eligibility_reason = ?, eligibility_version = ?,
-                       eligibility_at = ?
+                       eligibility_at = ?, eligibility_input = ?
         WHERE url = ?
     """, (status, f"manual decision{': ' + note if note else ''}", MANUAL_VERSION,
-          datetime.now(UTC).isoformat(), url))
+          datetime.now(UTC).isoformat(), input_hash(dict(row)), url))
+
     conn.commit()
     return cur.rowcount == 1
