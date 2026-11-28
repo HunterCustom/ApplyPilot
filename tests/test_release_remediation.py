@@ -1304,12 +1304,30 @@ from applypilot.discovery import jobspy as jobspy_mod
 from applypilot.discovery import smartextract, workday
 
 
+SYNTH_PREFS = {"salary": {"hours_per_year": 2080, "undisclosed": 5,
+                           "bands": [{"min": 100000, "label": "top", "points": 30},
+                                     {"min": 60000, "label": "mid", "points": 15},
+                                     {"min": 0, "label": "low", "points": -10}]},
+               "commute": {"highest": 20, "high": 12, "acceptable": 5}}
+SYNTH_PRIORITY_YAML = """salary:
+  bands:
+    - {min: 100000, label: top, points: 30}
+    - {min: 60000, label: mid, points: 15}
+    - {min: 0, label: low, points: -10}
+"""
+
+
 class RankingTests(unittest.TestCase):
+    def test_unconfigured_salary_is_neutral(self):
+        none = ranking.preference_points({"salary": None}, ranking.DEFAULTS)[0]
+        paid = ranking.preference_points({"salary": "$40,000 a year"}, ranking.DEFAULTS)[0]
+        self.assertEqual(none, paid)
+
     def test_salary_is_a_preference_never_a_filter(self):
         jobs = [{"url": "low", "fit_score": 8, "salary": "$40,000 a year"},
                 {"url": "none", "fit_score": 8, "salary": None},
                 {"url": "high", "fit_score": 8, "salary": "$95,000 - $105,000 a year"}]
-        ranked = ranking.rank(jobs, ranking.DEFAULTS)
+        ranked = ranking.rank(jobs, SYNTH_PREFS)
         self.assertEqual([j["url"] for j in ranked], ["high", "none", "low"])
         self.assertEqual(len(ranked), 3)  # nothing dropped
 
@@ -1317,11 +1335,11 @@ class RankingTests(unittest.TestCase):
         jobs = [{"url": "far", "fit_score": 8, "eligibility_tier": "acceptable"},
                 {"url": "near", "fit_score": 8, "eligibility_tier": "highest"},
                 {"url": "better-fit", "fit_score": 10, "eligibility_tier": "acceptable", "salary": "$40,000"}]
-        self.assertEqual([j["url"] for j in ranking.rank(jobs, ranking.DEFAULTS)], ["better-fit", "near", "far"])
+        self.assertEqual([j["url"] for j in ranking.rank(jobs, SYNTH_PREFS)], ["better-fit", "near", "far"])
 
     def test_hourly_pay_is_annualized_and_flagged(self):
-        label, _pts, note = ranking.salary_band({"salary": "$30 - $35 an hour"}, ranking.DEFAULTS)
-        self.assertEqual(label, "acceptable")  # ~$67,600 at 2080 h
+        label, _pts, note = ranking.salary_band({"salary": "$30 - $35 an hour"}, SYNTH_PREFS)
+        self.assertEqual(label, "mid")  # ~$67,600 at 2080 h
         self.assertIn("confirm hours, classification, benefits and travel pay", note)
 
     def test_preferences_from_priority_yaml(self):
@@ -1335,6 +1353,7 @@ class RankingTests(unittest.TestCase):
 
 class TailorRankingTests(TailorTests):
     def test_batch_limit_takes_the_best_ranked_jobs(self):
+        (self.app / "priority.yaml").write_text(SYNTH_PRIORITY_YAML, encoding="utf-8")
         urls = []
         for i, sal in enumerate(("$45,000 a year", "$100,000 a year")):
             u = f"https://careers.synthbank.test/jobs/{900 + i}"

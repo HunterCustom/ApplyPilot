@@ -26,6 +26,7 @@ to robots.txt. A verification records the URL actually reached and is bound to t
 """
 from __future__ import annotations
 
+import functools
 import http.client
 import ipaddress
 import logging
@@ -94,7 +95,7 @@ class UnsafeDestination(ValueError):
 
 
 def resolve_host(host: str, port: int) -> list[str]:
-    return sorted({ai[4][0] for ai in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+    return sorted({str(ai[4][0]) for ai in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
 
 
 def is_public_ip(addr: str) -> bool:
@@ -147,12 +148,13 @@ class _PinnedHTTP(http.client.HTTPConnection):
 
 class _PinnedHTTPS(http.client.HTTPSConnection):
     def __init__(self, host: str, ip: str, port: int, timeout: float) -> None:
-        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._tls = ssl.create_default_context()
+        super().__init__(host, port=port, timeout=timeout, context=self._tls)
         self._ip = ip
 
     def connect(self) -> None:
         raw = socket.create_connection((self._ip, self.port), self.timeout)
-        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)  # certificate checked for host
+        self.sock = self._tls.wrap_socket(raw, server_hostname=self.host)  # certificate checked for host
 
 
 def safe_fetch(url: str, timeout: float, *, resolve: Callable[[str, int], list[str]] = resolve_host,
@@ -314,11 +316,12 @@ def check_posting(job: dict, *, fetch: Fetcher = http_fetch, robots: RobotsCache
         return CheckResult("inaccessible", "robots.txt disallows automated checks", None, url)
     if throttle is not None:
         throttle.wait(url)
+    fetcher: Fetcher = fetch
     if fetch is http_fetch and robots is not None:
-        def fetch(u, t, _r=robots):  # every redirect hop is also subject to robots.txt
-            return safe_fetch(u, t, hop_allowed=_r.allowed)
+        hop_allowed = robots.allowed  # every redirect hop is also subject to robots.txt
+        fetcher = functools.partial(safe_fetch, hop_allowed=hop_allowed)
     try:
-        status, final_url, html = fetch(url, timeout)
+        status, final_url, html = fetcher(url, timeout)
     except UnsafeDestination as e:
         return CheckResult("inaccessible", f"unsafe destination: {e}", None, url)
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException) as e:

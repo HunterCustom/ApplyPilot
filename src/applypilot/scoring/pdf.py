@@ -26,7 +26,7 @@ def _esc(value) -> str:
 
 def _escaped(resume: dict) -> dict:
     """Copy of a parsed resume with every text field HTML-escaped (parsing is unaffected)."""
-    out = {k: _esc(resume.get(k)) for k in ("name", "title", "location", "contact")}
+    out: dict = {k: _esc(resume.get(k)) for k in ("name", "title", "location", "contact")}
     out["sections"] = {k: _esc(v) for k, v in (resume.get("sections") or {}).items()}
     return out
 

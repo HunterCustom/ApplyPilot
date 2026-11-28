@@ -1,23 +1,20 @@
 """Preference ranking (fork): salary and commute tier influence order, never eligibility.
 
 Order = ``fit_score * FIT_WEIGHT`` (20) + salary points + commute points. Fit stays the main
-signal: with the default bands the whole preference spread (-15..+30 salary, 0..+20 commute) is
-worth a bit over two fit points, so pay and commute reorder similar fits but cannot lift a clearly
-weaker match above a much better one. Nothing here filters: undisclosed or low pay only lowers the
-order, and eligibility is still decided by ``eligibility.py``.
+signal; keep the configured preference spread to about two fit points (40) so pay and commute
+reorder similar fits but cannot lift a clearly weaker match above a much better one. Nothing
+here filters: undisclosed or low pay only lowers the order, and eligibility is still decided by
+``eligibility.py``.
 
-Configured in ``APP_DIR/priority.yaml`` (optional; defaults below)::
+Configured in ``APP_DIR/priority.yaml`` (the candidate's own figures stay in that private file;
+without ``salary.bands`` pay does not affect the order)::
 
     salary:
       hours_per_year: 2080          # used to annualize hourly pay (flagged for human review)
       undisclosed: 5                # points when no salary is published
       bands:                        # first band whose minimum the annual midpoint reaches
-        - {min: 110000, label: exceptional, points: 30}
-        - {min: 90000,  label: very high,   points: 25}
-        - {min: 75000,  label: high,        points: 18}
-        - {min: 60000,  label: acceptable,  points: 10}
-        - {min: 50000,  label: review,      points: 0}
-        - {min: 0,      label: low,         points: -15}
+        - {min: <annual amount>, label: <name>, points: <number>}
+        - {min: 0,               label: low,    points: -10}
     commute:                        # eligibility tier -> points
       highest: 20
       high: 12
@@ -34,14 +31,7 @@ DEFAULTS: dict = {
     "salary": {
         "hours_per_year": 2080,
         "undisclosed": 5,
-        "bands": [
-            {"min": 110000, "label": "exceptional", "points": 30},
-            {"min": 90000, "label": "very high", "points": 25},
-            {"min": 75000, "label": "high", "points": 18},
-            {"min": 60000, "label": "acceptable", "points": 10},
-            {"min": 50000, "label": "review", "points": 0},
-            {"min": 0, "label": "low", "points": -15},
-        ],
+        "bands": [],  # set in APP_DIR/priority.yaml; empty = pay does not affect the order
     },
     "commute": {"highest": 20, "high": 12, "acceptable": 5},
 }
@@ -75,7 +65,8 @@ def load_preferences(path=None) -> dict:
     except (OSError, ValueError, ImportError, yaml_error()):  # optional file: defaults apply
         data = {}
     data = data if isinstance(data, dict) else {}
-    sal = data.get("salary") if isinstance(data.get("salary"), dict) else {}
+    sal_raw = data.get("salary")
+    sal: dict = sal_raw if isinstance(sal_raw, dict) else {}
     for k in ("hours_per_year", "undisclosed"):
         if isinstance(sal.get(k), (int, float)):
             prefs["salary"][k] = sal[k]
@@ -84,7 +75,8 @@ def load_preferences(path=None) -> dict:
         prefs["salary"]["bands"] = sorted(
             [{"min": b["min"], "label": str(b.get("label", "")), "points": float(b.get("points", 0))} for b in bands],
             key=lambda b: -b["min"])
-    com = data.get("commute") if isinstance(data.get("commute"), dict) else {}
+    com_raw = data.get("commute")
+    com: dict = com_raw if isinstance(com_raw, dict) else {}
     for tier, pts in com.items():
         if isinstance(pts, (int, float)):
             prefs["commute"][str(tier)] = pts
@@ -122,6 +114,8 @@ def salary_band(job: dict, prefs: dict | None = None) -> tuple[str, float, str]:
     prefs = prefs or DEFAULTS
     sal = prefs["salary"]
     parsed = parse_salary(job.get("salary"), float(sal["hours_per_year"]))
+    if not sal["bands"]:
+        return "not ranked", 0.0, "salary preferences not configured (priority.yaml salary.bands)"
     if parsed is None:
         return "undisclosed", float(sal["undisclosed"]), "no salary published (not a rejection)"
     mid = (parsed["annual_low"] + parsed["annual_high"]) / 2
@@ -132,7 +126,7 @@ def salary_band(job: dict, prefs: dict | None = None) -> tuple[str, float, str]:
     for b in sal["bands"]:
         if mid >= b["min"]:
             return b["label"], float(b["points"]), note
-    return "low", 0.0, note
+    return "below all bands", 0.0, note
 
 
 def preference_points(job: dict, prefs: dict | None = None) -> tuple[float, str]:
