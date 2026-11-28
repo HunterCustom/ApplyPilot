@@ -210,6 +210,30 @@ def register(app: typer.Typer) -> None:
             t.add_row(*[_e(r.get(c))[:300] for c in cols])
         console.print(t)
 
+    @app.command("isolation")
+    def isolation_cmd(
+        attest: bool = typer.Option(False, "--attest", help="Record THIS computer as a dedicated isolated browser host."),
+        statement: str = typer.Option("", "--statement", help="Who set the host up, and how (stored with the record)."),
+    ) -> None:
+        """Isolated browser host status (browser sessions run only on an attested dedicated VM)."""
+        from applypilot.apply import isolation
+        if attest:
+            if not statement.strip():
+                console.print("[red]--statement is required (describe the dedicated VM and who set it up).[/red]")
+                raise typer.Exit(code=2)
+            try:
+                path = isolation.attest(statement)
+            except RuntimeError as e:
+                console.print(f"[red]{_e(e)}[/red]")
+                raise typer.Exit(code=2) from e
+            console.print(f"Attested: {_e(path)}")
+        problem = isolation.browser_host_problem()
+        console.print("Browser sessions: " + ("[green]allowed on this host[/green]" if problem is None
+                                              else f"[yellow]disabled[/yellow] -- {_e(problem)}"))
+        console.print("Requirements for an isolated browser host:")
+        for r in isolation.REQUIREMENTS:
+            console.print(f"  - {_e(r)}")
+
     @app.command("daily")
     def daily_cmd(
         plan: bool = typer.Option(False, "--plan", help="Show what would run; execute nothing."),

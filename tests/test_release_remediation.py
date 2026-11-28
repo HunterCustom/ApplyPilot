@@ -1094,5 +1094,119 @@ class SensitiveLeakTests(unittest.TestCase):
         self.assertEqual(set(out), {"PATH", "SYSTEMROOT", "ANTHROPIC_API_KEY", "HTTPS_PROXY", "LC_ALL"})
 
 
+
+# --- R6 / R12: browser host isolation, binary provenance, start-up cleanup --------------------------------
+
+import shutil
+
+from applypilot.apply import isolation, proc_jail
+
+INSTALLED_CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+
+class IsolatedHostGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        p = mock.patch.object(config, "APP_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_not_attested_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(isolation.ENV_FLAG, None)
+            self.assertIn("disabled on this host", isolation.browser_host_problem())
+
+    def test_flag_alone_or_a_foreign_attestation_is_not_enough(self):
+        with mock.patch.dict(os.environ, {isolation.ENV_FLAG: "1"}):
+            self.assertIn("missing", isolation.browser_host_problem())
+            (self.tmp / isolation.ATTEST_FILE).write_text(json.dumps({"computer": "some-other-vm"}), encoding="utf-8")
+            self.assertIn("different computer", isolation.browser_host_problem())
+            isolation.attest("dedicated ApplyPilot VM, synthetic test")
+            self.assertIsNone(isolation.browser_host_problem())
+        os.environ.pop(isolation.ENV_FLAG, None)
+        self.assertIsNotNone(isolation.browser_host_problem())  # the file alone is not enough either
+
+    def test_attest_requires_the_flag(self):
+        os.environ.pop(isolation.ENV_FLAG, None)
+        with self.assertRaises(RuntimeError):
+            isolation.attest("x")
+
+    def test_launch_is_refused_before_anything_starts(self):
+        """No profile, no port sweep, no process: the gate runs first (audit R6)."""
+        os.environ.pop(isolation.ENV_FLAG, None)
+        with mock.patch.object(chrome, "acquire_worker_slot", side_effect=AssertionError("slot taken")), \
+                mock.patch.object(chrome, "_kill_on_port", side_effect=AssertionError("port touched")), \
+                mock.patch.object(proc_jail, "ProcessJail", side_effect=AssertionError("jail created")), \
+                mock.patch.object(chrome.subprocess, "Popen", side_effect=AssertionError("process started")),                 self.assertRaises(RuntimeError) as cm:
+            chrome.launch_chrome(43, port=9556, headless=True, proxy_port=None)
+        self.assertIn("isolated browser host", str(cm.exception))
+
+
+@unittest.skipUnless(sys.platform == "win32", "Authenticode is Windows-only")
+class ChromeProvenanceTests(unittest.TestCase):
+    def test_unsigned_file_named_chrome_is_refused(self):
+        """Audit reproduction: the binary check accepted an empty temporary file named chrome.exe."""
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "chrome.exe"
+            fake.write_bytes(b"")
+            with self.assertRaises(RuntimeError) as cm:
+                chrome.require_chrome_binary(str(fake))
+            self.assertIn("signature", str(cm.exception))
+
+    def test_validly_signed_non_google_binary_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            other = Path(d) / "chrome.exe"
+            shutil.copyfile(sys.executable, other)  # a real, signed executable -- but not Google's
+            problem = chrome.chrome_signature_problem(str(other))
+            self.assertIsNotNone(problem)
+            with self.assertRaises(RuntimeError):
+                chrome.require_chrome_binary(str(other))
+
+    @unittest.skipUnless(os.path.isfile(INSTALLED_CHROME), "Google Chrome not installed")
+    def test_installed_google_chrome_is_accepted(self):
+        self.assertIsNone(chrome.chrome_signature_problem(INSTALLED_CHROME))
+        self.assertEqual(Path(chrome.require_chrome_binary(INSTALLED_CHROME)).name.lower(), "chrome.exe")
+
+
+@unittest.skipUnless(proc_jail.jail_supported(), "process jail is Windows-only")
+class StartupFailureCleanupTests(unittest.TestCase):
+    def test_failed_start_closes_the_jail_and_forgets_the_handles(self):
+        """Audit R12: a start-up exception after publishing the jail left handles in the registries."""
+        closed = []
+
+        class Proc:
+            pid = 4321
+            returncode = 21
+
+            def poll(self):
+                return 21
+
+        class FakeJail:
+            def __init__(self, allowed, on_escape):
+                pass
+
+            def spawn(self, cmd, **kw):
+                return Proc()
+
+            def close(self):
+                closed.append(True)
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch("applypilot.apply.isolation.browser_host_problem", return_value=None), \
+                mock.patch.object(chrome, "acquire_worker_slot"), \
+                mock.patch.object(chrome, "setup_worker_profile", return_value=Path(d)), \
+                mock.patch.object(chrome, "_kill_on_port", return_value=True), \
+                mock.patch.object(chrome.config, "get_chrome_path", return_value=sys.executable), \
+                mock.patch.object(chrome, "require_chrome_binary", side_effect=lambda p: p), \
+                mock.patch.object(chrome, "_kill_process_tree"), \
+                mock.patch.object(proc_jail, "ProcessJail", FakeJail), \
+                mock.patch.object(chrome.time, "sleep"),                 self.assertRaises(RuntimeError) as cm:
+            chrome.launch_chrome(44, port=9557, headless=True, proxy_port=None)
+        self.assertIn("profile directory is in use", str(cm.exception))
+        self.assertEqual(closed, [True])
+        self.assertNotIn(44, chrome._jails)
+        self.assertNotIn(44, chrome._chrome_procs)
+
+
 if __name__ == "__main__":
     unittest.main()

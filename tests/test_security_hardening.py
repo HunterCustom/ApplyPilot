@@ -379,7 +379,11 @@ class BrowserContainmentPolicyTests(unittest.TestCase):
                     chrome.require_chrome_binary(str(p))
             ok = Path(d) / "chrome.exe"
             ok.write_bytes(b"")
-            self.assertEqual(Path(chrome.require_chrome_binary(str(ok))).name, "chrome.exe")
+            # the name rule alone accepts it ...
+            self.assertEqual(Path(chrome.require_chrome_binary(str(ok), verify_signature=False)).name, "chrome.exe")
+            if sys.platform == "win32":  # ... but an unsigned file named chrome.exe is refused (audit R6)
+                with self.assertRaises(RuntimeError):
+                    chrome.require_chrome_binary(str(ok))
         with self.assertRaises(RuntimeError):
             chrome.require_chrome_binary(r"C:\nonexistent\chrome.exe")
 
@@ -402,7 +406,7 @@ class BrowserContainmentPolicyTests(unittest.TestCase):
                 mock.patch.object(chrome, "setup_worker_profile", return_value=Path(d)), \
                 mock.patch.object(chrome, "_kill_on_port", return_value=True), \
                 mock.patch.object(chrome.config, "get_chrome_path", return_value=sys.executable), \
-                mock.patch.object(chrome, "require_chrome_binary", side_effect=lambda p: p), \
+                mock.patch.object(chrome, "require_chrome_binary", side_effect=lambda p: p),                 mock.patch("applypilot.apply.isolation.browser_host_problem", return_value=None), \
                 mock.patch.object(proc_jail, "ProcessJail", FakeJail), \
                 mock.patch.object(chrome.time, "sleep"), \
                 mock.patch.object(chrome.subprocess, "Popen", side_effect=AssertionError("unjailed launch")):

@@ -353,7 +353,7 @@ class SubmitApprovalTests(TempDirCase):
 
 
 class CliSubmissionGateTests(TempDirCase):
-    def invoke(self, args):
+    def invoke(self, args, isolated=True):
         from typer.testing import CliRunner
 
         from applypilot import cli
@@ -361,12 +361,21 @@ class CliSubmissionGateTests(TempDirCase):
         conn.execute.return_value.fetchone.return_value = [1]
         profile = self.tmp / "profile.json"
         profile.write_text("{}")
-        with mock.patch.object(cli, "_bootstrap"), mock.patch.object(config, "check_tier"), \
+        host = None if isolated else "browser sessions are disabled on this host"
+        with mock.patch.object(cli, "_bootstrap"), mock.patch.object(config, "check_tier"),                 mock.patch("applypilot.apply.isolation.browser_host_problem", return_value=host), \
                 mock.patch.object(config, "PROFILE_PATH", profile), \
                 mock.patch("applypilot.database.get_connection", return_value=conn), \
                 mock.patch.object(launcher, "main") as main:
             result = CliRunner().invoke(cli.app, ["apply", *args])
         return result, main
+
+    def test_no_browser_session_on_a_non_isolated_host(self):
+        """Audit R6: dry runs and real runs alike refuse to start on a host that is not attested."""
+        for args in (["--dry-run", "--url", "https://x.test/1"], ["--allow-real-submissions"]):
+            with self.subTest(args=args):
+                result, main = self.invoke(args, isolated=False)
+                self.assertEqual(result.exit_code, 2)
+                main.assert_not_called()
 
     def test_real_run_refused_without_explicit_flag(self):
         result, main = self.invoke([])

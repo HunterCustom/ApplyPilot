@@ -276,14 +276,56 @@ CHROME_BINARY_NAMES = frozenset({"chrome.exe", "chromium.exe", "chrome", "chromi
                                  "google-chrome", "google-chrome-stable", "google chrome"})
 
 
-def require_chrome_binary(path: str) -> str:
-    """The resolved path if it is a Chrome/Chromium executable, else RuntimeError."""
+def require_chrome_binary(path: str, verify_signature: bool = True) -> str:
+    """The resolved path if it is a Chrome/Chromium executable, else RuntimeError.
+
+    On Windows the file must also carry a valid Authenticode signature from Google LLC (audit R6):
+    a renamed or replaced ``chrome.exe`` is refused, not just a wrongly named binary."""
     import os
     real = os.path.realpath(path)
     if os.path.basename(real).lower() not in CHROME_BINARY_NAMES or not os.path.isfile(real):
         raise RuntimeError(f"refusing to launch {os.path.basename(real)!r}: ApplyPilot runs only Google Chrome or "
                            "Chromium (set CHROME_PATH to chrome.exe)")
+    if verify_signature and platform.system() == "Windows":
+        problem = chrome_signature_problem(real)
+        if problem:
+            raise RuntimeError(f"refusing to launch {real}: {problem}")
     return real
+
+
+_SIGNATURE_CACHE: dict[tuple[str, int, int], str | None] = {}
+GOOGLE_SIGNER = "O=Google LLC"
+
+
+def chrome_signature_problem(path: str) -> str | None:
+    """None if ``path`` has a valid Authenticode signature by Google LLC (Windows), else why not."""
+    import os
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return f"cannot read the browser binary ({type(e).__name__})"
+    key = (os.path.normcase(path), st.st_size, int(st.st_mtime))
+    if key in _SIGNATURE_CACHE:
+        return _SIGNATURE_CACHE[key]
+    quoted = path.replace("'", "''")
+    script = (f"$s = Get-AuthenticodeSignature -LiteralPath '{quoted}'; "
+              "[pscustomobject]@{status=[string]$s.Status; subject=[string]$s.SignerCertificate.Subject} "
+              "| ConvertTo-Json -Compress")
+    try:
+        out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                             capture_output=True, text=True, timeout=60, check=False).stdout
+        info = json.loads(out.strip() or "{}")
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        return f"could not verify the browser's signature ({type(e).__name__})"
+    status, subject = str(info.get("status") or ""), str(info.get("subject") or "")
+    if status != "Valid":
+        problem = f"browser binary signature is {status or 'missing'} (expected a valid Google LLC signature)"
+    elif GOOGLE_SIGNER not in subject:
+        problem = "browser binary is not signed by Google LLC"
+    else:
+        problem = None
+    _SIGNATURE_CACHE[key] = problem
+    return problem
 
 
 def launch_chrome(worker_id: int, port: int | None = None,
@@ -307,6 +349,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
     """
     if port is None:
         port = BASE_CDP_PORT + worker_id
+
+    # Audit R6: no ApplyPilot browser on a host that is not an attested isolated browser host.
+    from applypilot.apply.isolation import browser_host_problem
+    problem = browser_host_problem()
+    if problem:
+        raise RuntimeError(problem)
 
     # Exclusive slot first: only then is a Chrome on this port/profile provably a leftover of ours.
     acquire_worker_slot(worker_id)
@@ -364,9 +412,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if proc.poll() is not None:
         # rc 21: another Chrome already owns this profile and took over the launch (process
         # singleton), so this one never opens its debugger -- one cause of "debugger unreachable".
-        raise RuntimeError(f"Chrome exited during start-up (rc={proc.returncode}); "
-                           + ("its profile directory is in use by another Chrome" if proc.returncode == 21
-                              else "see the Chrome log"))
+        rc = proc.returncode
+        cleanup_worker(worker_id, proc)  # audit R12: close the jail and forget the handles now
+        raise RuntimeError(f"Chrome exited during start-up (rc={rc}); "
+                           + ("its profile directory is in use by another Chrome" if rc == 21
+                              else "the debugger never opened (profile/policy problem; see the Chrome log)"))
+
     logger.info("[worker-%d] Chrome started on port %d (pid %d)",
                 worker_id, port, proc.pid)
     return proc

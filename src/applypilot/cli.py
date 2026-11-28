@@ -241,6 +241,13 @@ def apply(
 
     # --- Full apply mode ---
 
+    # Audit R6: browser sessions (dry or real) only on an attested isolated browser host.
+    from applypilot.apply.isolation import browser_host_problem
+    host_problem = browser_host_problem()
+    if host_problem:
+        console.print(f"[red]{escape(host_problem)}[/red]")
+        raise typer.Exit(code=2)
+
     # Check 1: Tier 3 required (Claude Code CLI + Chrome)
     check_tier(3, "auto-apply")
 
