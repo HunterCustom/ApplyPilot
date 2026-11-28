@@ -1,24 +1,24 @@
 # Project Status
 
-_Updated 2026-11-27 (completion pass) · Branch `feature/claude-development` · Fork of `upstream/main`
+_Updated 2026-11-28 (release remediation) · Branch `feature/claude-development` · Fork of `upstream/main`
 (4a8d521) plus fork commits. Next steps: `DEVELOPMENT_ROADMAP.md`. Apply hardening: `APPLY_AGENT_SECURITY_PLAN.md`.
-Operating guide: `DEPLOYMENT.md`. Completion summary: `PROJECT_COMPLETION_REPORT.md`._
+Operating guide: `DEPLOYMENT.md`. Remediation of `FINAL_RELEASE_AUDIT.md`: `FINAL_REMEDIATION_REPORT.md`._
 
 ## Current state
 | Area | State |
 |---|---|
 | Discovery | JobSpy / Workday / smart extract, each isolated; configurable `searches.yaml: discovery.sources`; run log (`discovery_runs`), sighting history (`job_sources`, first/last seen, seen count), exact posting dates only. |
-| Verification | `applypilot verify` / stage `verify`: active / closed / removed / inaccessible / uncertain; robots.txt + per-host delay; freshness gate (`pipeline.yaml`). Not yet run on real postings. |
-| Dedupe | Cross-source only for text similarity; URL / requisition-ID rules. On a dev-DB copy: 2 true duplicates, 0 false merges after the Workday fix. |
-| Eligibility | Deterministic v1.0.0, runs before scoring (`classify` stage); gates tailoring, readiness and applying. |
-| Scoring | Local Qwen3-14B (unchanged default); model + prompt version recorded; malformed/timeout responses retried, errors persisted, capped at 5; history kept on rescoring. |
-| Documents | Fail-open fixed: judge-rejected resume → `needs_review`, never ready. Deterministic grounding (factcheck) + ATS checks in every mode; rejected attempts in `rejected/`; staleness fingerprint. Cover letters validated the same way. Never run on real data yet. |
+| Verification | `applypilot verify` / stage `verify`: public-destination policy with pinned dialing, manual per-hop redirects + robots, same-site/ATS-tenant + whole-word title + requisition checks, final URL recorded, bound to the URL checked (R3). Not yet run on real postings. |
+| Dedupe | Requisition identity first; job-specific URLs only (cross-field); no cutoff for exact ids; conflicting requisitions never grouped (flagged); history-sticky links (R9). Dev-DB copy: 2 true duplicates, 0 false merges. |
+| Eligibility | Deterministic v1.0.0, runs before scoring (`classify` stage); decisions bound to an input hash (reclassified on change; manual decisions bound to the posting text); gates tailoring, cover letters, readiness and applying. |
+| Scoring | Local Qwen3-14B (unchanged default); exactly one in-range SCORE accepted (R11); model, prompt, evidence and resume hashes recorded; `applypilot rescore` replaces only stale scores, history kept. Ranking: fit + salary/commute preferences (`ranking.py`, never a filter). |
+| Documents | Judge verdict parsed strictly; factcheck covers degrees/institutions, leadership, titles, numbers in context. Approved text and its PDF are content-hashed; readiness, review approval and the agent all use exactly those bytes; any change blocks the job and withdraws approval (R1). PDF rendering escaped, script-free, offline (R2). Never run on real data yet. |
 | Screening | `screening_answers.yaml` (verified, reuse opt-in); sensitive/unsupported → human. Invented prompt defaults removed. |
 | Readiness / review | `applypilot run prepare`, `applypilot review` (sheet, approve/reject/defer/mark-submitted). Launcher claims only ready jobs; real runs only human-approved ones. |
-| Daily | `applypilot daily` (lock, limits, model check, JSONL log, exit codes 0–4); `scripts/run_daily.ps1` + Task Scheduler template. Not scheduled on this PC. |
+| Daily | `applypilot daily`: OS-held lock shared with `run`/`rescore`, taken before migrations; interrupted runs reconciled; in-stage deadline; partial failures exit 1 (R5). `scripts/run_daily.ps1` + Task Scheduler template. Not scheduled on this PC. |
 | Reports | `applypilot report <name>` with filter/sort/CSV/JSON (no profile data). |
-| Apply | Phase 3b + audit fixes (`66b3c45`): proxy kill switch + write gate, process jail, causal evidence, atomic approvals, tenant scoping. **Still not certified submission-proof; no apply run yet (dry or real).** |
-| Tests | 258 pass incl. 20 real-Chrome tests (installed Chrome 158, jailed, loopback fixtures only); see `PROJECT_COMPLETION_REPORT.md`. |
+| Apply | **Disabled on this PC**: browser sessions (dry or real) run only on an attested isolated browser host (dedicated VM, R6). Google-signed Chrome only. Causal receipts (request id, release journal, server response; R4), committed approvals (R7), live-claim rechecks (R8). **Not certified submission-proof; no apply run yet.** |
+| Tests | 381 pass, 0 skipped, incl. real-Chrome boundary tests and real Playwright render tests; see `FINAL_REMEDIATION_REPORT.md`. |
 
 ## Safety model (apply)
 - **Statuses**: NULL/`failed` (retryable), `dry_run`, `in_progress`, `applied`, `needs_review`, `manual`.
@@ -162,10 +162,14 @@ Totals: 5 eligible_nc + 6 eligible_us_remote ready to tailor; 6 NC-commute revie
   condense output (use `ctx_execute` for large data, `Read` with offset/limit for source).
 
 ## Known remaining issues
-Full list with severity: `PROJECT_COMPLETION_REPORT.md` § Known limitations. Most important:
+Full list: `FINAL_REMEDIATION_REPORT.md` § Remaining blockers and limitations. Most important:
+- OS-brokered protocol handoffs cannot be prevented on a personal desktop: browser sessions are therefore
+  disabled except on an attested isolated VM (not yet built or validated).
 - Apply boundary residuals: a page-level JS GET that changes server state is not recognisable (applicant
-  values in URLs are); workers can still open WebSockets (tripwire + revoke, page-level transports removed);
-  OS handlers launched out-of-process by the shell are outside the job object (never test-triggered).
+  values in URLs are); workers can still open WebSockets (tripwire + revoke, page-level transports removed).
+- Submission evidence is the server's HTTP answer to the approved request plus a page confirmation; no
+  ATS-specific receipt (application ID) parsing.
+
 - Approvals bind the request identity and digest, but not the rendered DOM a human saw (no screenshot tool).
 - Multi-step ATS flows need one approval per state-changing request; expect many on Workday.
 - Verification is static HTML only: script-rendered postings come back `uncertain` (manual review /

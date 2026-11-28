@@ -34,7 +34,7 @@ Status and plan live in `PROJECT_STATUS.md`, `DEVELOPMENT_ROADMAP.md` and
 ## Commands (PowerShell, repo root)
 ```powershell
 $env:APPLYPILOT_DIR = "$HOME\.applypilot-dev"
-.\.venv\Scripts\python.exe -m pytest tests/ -q          # ~255 tests (~90 s, real jailed headless Chrome), temp DBs only
+.\.venv\Scripts\python.exe -m pytest tests/ -q          # ~380 tests (~2 min, real jailed headless Chrome + Playwright), temp DBs only
 .\.venv\Scripts\python.exe -m ruff check <changed files> # repo-wide ruff has ~147 pre-existing findings; don't add new ones
 .\.venv\Scripts\applypilot.exe doctor                    # read-only setup check
 .\.venv\Scripts\applypilot.exe status                    # pipeline counts
@@ -65,6 +65,13 @@ Python 3.13 venv at `.venv`. Default LLM: local LM Studio at `http://127.0.0.1:1
   `cli_ops.py` (verify/dedupe/review/screening/report/daily commands). Operating guide: `DEPLOYMENT.md`.
 - `apply/proc_jail.py`: worker Chrome runs in a Job Object; non-Chrome children are killed. Never add tests
   that activate mailto:/tel:/custom schemes (the OS handler launched the user's personal browser).
+- `apply/isolation.py`: `launch_chrome` / `apply` refuse unless the host is an attested isolated browser
+  host (dedicated VM; `APPLYPILOT_ISOLATED_BROWSER_HOST=1` + `applypilot isolation --attest`). Never
+  attest this development PC. Chrome must be Google-signed (`chrome_signature_problem`).
+- Remediation modules: `runctl.py` (in-stage deadline), `ranking.py` (fit + salary/commute preferences;
+  the candidate's pay figures live only in `APP_DIR/priority.yaml`). Documents are bound by content hash
+  (`scoring/documents.artifact_problems`); `daily.RunLock` is an OS byte-range lock shared by
+  `daily`/`run`/`rescore`. Regression tests for FINAL_RELEASE_AUDIT.md: `tests/test_release_remediation.py`.
 
 - `apply/launcher.py` — acquires a job (SQLite `BEGIN IMMEDIATE`), launches Chrome with CDP,
   spawns a least-privilege `claude -p` via `build_agent_command` (`--tools ""`, `--setting-sources ""`,

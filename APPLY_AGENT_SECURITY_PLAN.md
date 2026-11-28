@@ -1,8 +1,19 @@
 # Apply Agent Security Plan
 
-_Status (2026-11-27, completion pass `66b3c45`): S1–S6 implemented; Phase 3b implemented and the
-independent audit (`CODEX_PHASE3B_AUDIT.md`, verdict FAIL) answered below. No apply run (dry or real) has
-happened. Verified only on synthetic local pages. **Not certified submission-proof.**_
+_Status (2026-11-28, release remediation): S1–S6 and Phase 3b implemented; both independent audits
+(`CODEX_PHASE3B_AUDIT.md`, `FINAL_RELEASE_AUDIT.md`, verdict FAIL) answered below and in
+`FINAL_REMEDIATION_REPORT.md`. **Browser sessions are disabled except on an attested isolated browser
+host (dedicated VM)** because OS-brokered protocol handoffs cannot be prevented on a personal desktop.
+No apply run (dry or real) has happened. **Not certified submission-proof.**_
+
+## Final release audit response (FINAL_RELEASE_AUDIT.md)
+| Finding | Fix | Residual |
+|---|---|---|
+| R4 time-ordered evidence | Release journaled before continue; server response captured per request id (Fetch `interceptResponse`); applied needs approval after the click, matching id, 2xx/3xx, confirmation after the response, one write in the window; confirmation only from page-observation tools; unconfirmed seal = uncertain | No ATS receipt / application-ID parsing |
+| R6 OS-brokered handoffs | Browser only on an attested isolated host (env flag + host-bound record); Google-signed Chrome (Authenticode) | VM not yet built/validated; job object kept for descendant cleanup |
+| R7 approvals | `used` marker is the commit point; cleanup best-effort; grants via `os.link`; click re-checked after the wait | DOM state at click time not bound |
+| R8 claims | `_still_ready` checks ownership, `applied_at`, live approval, fresh row, inside the release block; operator transitions transactional + append-only history | Running worker acts until its next check |
+| R10 leaks | Sensitive answers need `sensitive_ok`; display masks tokens/PII; stale secrets purged; env allowlist | Redaction is pattern-based |
 
 ## Audit response (CODEX_PHASE3B_AUDIT.md)
 | Finding | Fix | Evidence | Residual |

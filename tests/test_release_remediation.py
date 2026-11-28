@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import ClassVar
 from unittest import mock
 
-from test_preparation_pipeline import GOOD_JSON, PROFILE, FakeLLM, TailorTests, TempEnv
+from test_preparation_pipeline import GOOD_JSON, PROFILE, FakeLLM, TempEnv
 
 from applypilot import config, database, readiness
 from applypilot.apply import chrome, launcher
@@ -32,6 +32,17 @@ from applypilot.scoring import pdf as pdf_mod
 atexit.unregister(chrome.cleanup_on_exit)
 NOW_ISO = __import__('datetime').datetime.now(__import__('datetime').UTC).isoformat()
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _JobEnv(TempEnv):
+    """Fixture only (no tests): one verified, eligible, high-scoring posting."""
+
+    def job(self, url="https://careers.synthbank.test/jobs/77"):
+        from applypilot import eligibility as _el
+        self.add(url, application_url=url, fit_score=8, posting_status="active", posting_checked_at=NOW_ISO,
+                 posting_verified_url=url, eligibility_status="eligible_manual", eligibility_version=_el.MANUAL_VERSION)
+        _el.set_manual_decision(url, True, "synthetic", conn=self.conn)
+        return url
 
 
 def _json_with(**changes):
@@ -77,7 +88,7 @@ class JudgeParserTests(unittest.TestCase):
 
 # --- R1: fabricated claims cannot be approved even with a passing judge --------------------------------
 
-class GroundingTests(TailorTests):
+class GroundingTests(_JobEnv):
     def run_strict(self, data, judge_raw="VERDICT: PASS\nISSUES: none"):
         url = self.job()
         self.llm(RawJudgeLLM(judge_raw, tailor=data))
@@ -121,7 +132,7 @@ class GroundingTests(TailorTests):
 
 # --- R1: readiness and the queue bind to the exact artifacts -------------------------------------------
 
-class ArtifactBindingTests(TailorTests):
+class ArtifactBindingTests(_JobEnv):
     def prepared(self):
         (self.app / "pipeline.yaml").write_text("verify_delay_s: 0\nmin_score: 7\nrequire_cover_letter: true\n",
                                                 encoding="utf-8")
@@ -497,7 +508,7 @@ class PostingMatchTests(unittest.TestCase):
         self.assertEqual(st, "active")
 
 
-class InputBindingTests(TailorTests):
+class InputBindingTests(_JobEnv):
     def test_changed_application_url_invalidates_verification(self):
         """Audit reproduction: a changed application URL stayed fresh under the old URL's evidence."""
         url = self.job()
@@ -1303,7 +1314,6 @@ from applypilot import ranking
 from applypilot.discovery import jobspy as jobspy_mod
 from applypilot.discovery import smartextract, workday
 
-
 SYNTH_PREFS = {"salary": {"hours_per_year": 2080, "undisclosed": 5,
                            "bands": [{"min": 100000, "label": "top", "points": 30},
                                      {"min": 60000, "label": "mid", "points": 15},
@@ -1351,7 +1361,7 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(prefs["commute"]["highest"], 50)
 
 
-class TailorRankingTests(TailorTests):
+class TailorRankingTests(_JobEnv):
     def test_batch_limit_takes_the_best_ranked_jobs(self):
         (self.app / "priority.yaml").write_text(SYNTH_PRIORITY_YAML, encoding="utf-8")
         urls = []

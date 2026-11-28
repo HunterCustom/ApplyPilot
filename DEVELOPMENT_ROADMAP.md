@@ -16,19 +16,23 @@ with no fabricated qualifications, no duplicate submissions, and no CAPTCHA/acce
   evidence everywhere, screening answer bank (S6), readiness + review queue, daily orchestrator, reports,
   synthetic end-to-end tests, `DEPLOYMENT.md`.
 
+- **Final release remediation** (`6b990c5`..`319fa82`) — every `FINAL_RELEASE_AUDIT.md` finding R1–R12
+  fixed with regression tests (`FINAL_REMEDIATION_REPORT.md`); salary/commute ranking, data-dir
+  employer registries, permitted boards, stale-score rescoring.
+
 ## Next — needs the user (no code blockers)
-1. **Independent re-audit** of `66b3c45` (targets: `PROJECT_COMPLETION_REPORT.md` § Audit targets).
-   Do not run employer browser sessions before it.
-2. **Configuration**: write `screening_answers.yaml` (work auth, sponsorship, location, availability,
-   salary, plus any EEO "decline" answers you explicitly authorize with `sensitive_ok: true`); review
-   `candidate_evidence.yaml`; optional `pipeline.yaml` thresholds.
-3. **Real-data preparation, supervised**: `applypilot run verify dedupe classify` on the dev DB (network
-   GETs to postings), then `run score tailor cover pdf prepare` with `--min-score 7` in small batches; review
-   every document (`applypilot review --show URL`). Tune the factcheck vocabulary only with true facts.
-4. **First supervised dry runs** (after the re-audit): one approved job per run, `--dry-run --workers 1`,
-   watched. Extend `STATIC_ASSET_HOSTS` only with exact provider hosts seen in `network.jsonl`.
-5. **Supervised real submissions**: user approves each job and each request; verify confirmation emails.
-6. **Scheduling**: import `scripts/ApplyPilotDaily.task.xml` when the daily run has been watched once.
+1. **Independent re-audit** of the remediation commits (targets: `FINAL_REMEDIATION_REPORT.md` § Audit targets).
+2. **Candidate evidence**: confirm certification status/dates, employment dates, education and years of
+   experience (resume and stated figure differ) in `candidate_evidence.yaml` / `resume.txt`.
+3. **Real-data preparation, supervised**: `applypilot daily verify dedupe classify`, then
+   `applypilot rescore --limit 100` (historical scores came from another model name), then
+   `daily tailor cover pdf prepare` (5 resumes / 5 letters per run); review every document.
+4. **Employer watchlist**: add real Workday endpoints to `APP_DIR/employers.yaml`, run
+   `applypilot employers --verify` (none were added: no endpoint was verified in this pass).
+5. **Isolated browser host**: build the dedicated VM (`DEPLOYMENT.md` § 8a) before any apply session;
+   then first supervised dry run, one approved job, watched.
+6. **Scheduling**: import `scripts/ApplyPilotDaily.task.xml` only after an observed preparation cycle.
+
 
 ## Later (optional)
 - Job-specific receipt parsing for submission evidence (application ID on the confirmation page).
