@@ -456,7 +456,24 @@ def recover_stale_locks(max_age_seconds: int | None = None) -> int:
         WHERE {stale}
     """, (cutoff, own)).rowcount
     conn.commit()
+    purge_stale_secrets()
     return released + flagged
+
+
+def purge_stale_secrets() -> int:
+    """Delete verification-code files left by sessions that ended abruptly (audit R10).
+
+    Normal session end removes them; a crash or power loss could leave plaintext codes on
+    disk. Runs at every launcher start (with stale-claim recovery), before any new session."""
+    root = config.APP_DIR / "apply-sessions"
+    n = 0
+    for f in root.glob("*/secrets.txt") if root.exists() else []:
+        try:
+            f.unlink()
+            n += 1
+        except OSError:
+            logger.warning("could not remove stale verification secrets in %s", f.parent.name)
+    return n
 
 
 def release_lock(url: str, owner: str | None = None) -> bool:
@@ -849,35 +866,85 @@ def _guard_verified(session_dir: Path) -> bool:
 
 
 def submission_evidence(session_dir: Path) -> dict:
-    """Causal submission evidence from launcher-owned records (audit H3).
+    """Causal submission evidence from launcher-owned records (audit H3 / R4).
 
-    ``released``: human-approved state-changing requests the network guard actually handed
-    back to Chrome; ``ambiguous``: approved requests whose release could not be confirmed.
-    ``correlated``: a human-approved submit action, then a released write, then confirmation
-    text observed *after* that release, in that order. Anything less is not proof of applying.
+    Every human-approved write is tracked by its request id through: approval granted ->
+    ``release_attempt`` (journaled before Chrome may send it) -> ``released`` -> ``response``
+    (the server's HTTP status, captured by the guard). ``released`` counts writes handed back to
+    Chrome; ``ambiguous`` counts writes whose fate is unknown (unconfirmed release, an attempt
+    with no outcome, or a release whose response was never observed) -- data may have reached
+    the employer, so the job is never retried automatically.
+
+    ``correlated`` (the only path to ``applied``) requires, for one approved submit click:
+    exactly one released write between that click and the confirmation; that write's approval
+    was requested after the click and matches its request id; the server answered it with a
+    2xx/3xx status; and confirmation text was observed after that response. Timestamps alone,
+    a different request, or a confirmation that precedes the response never correlate.
     """
     audit = policy_mod.read_jsonl(session_dir / "audit.jsonl")
     clicks = sorted(float(r.get("t", 0)) for r in audit if r.get("submit_approved"))
-    releases = sorted(float(r.get("t", 0)) for r in audit if r.get("net_release") == "released")
-    ambiguous = sum(1 for r in audit if r.get("net_release") == "release_unconfirmed")
+    grants = {r.get("request_id"): r for r in audit if r.get("net_approved") and r.get("request_id")}
+    life: dict[str, dict[str, dict]] = {}
+    for r in audit:
+        if r.get("net_release") and r.get("request_id"):
+            life.setdefault(r["request_id"], {})[r["net_release"]] = r
+    released = {rid: d for rid, d in life.items() if "released" in d}
+    ambiguous = 0
+    for d in life.values():
+        if "release_unconfirmed" in d or ("release_attempt" in d and "released" not in d):
+            ambiguous += 1
+        elif "released" in d and "response" not in d:
+            ambiguous += 1  # sent, but the outcome of the request itself was never observed
     confirms = sorted(float(r.get("t", 0)) for r in audit if r.get("evidence") == "confirmation_text")
-    correlated = any(c <= rel and any(x > rel for x in confirms) for rel in releases for c in clicks)
-    return {"released": len(releases), "ambiguous": ambiguous, "correlated": correlated,
-            "approved": bool(clicks) and bool(releases), "confirmed": bool(confirms)}
+
+    def ok_response(d: dict) -> float | None:
+        resp = d.get("response") or {}
+        status = resp.get("status")
+        return float(resp.get("t", 0)) if isinstance(status, int) and 200 <= status < 400 else None
+
+    correlated = False
+    for c in clicks:
+        for rid, d in released.items():
+            g = grants.get(rid)
+            resp_t = ok_response(d)
+            if g is None or resp_t is None or float(g.get("requested_at", 0)) < c:
+                continue
+            later = [x for x in confirms if x > resp_t]
+            if not later:
+                continue
+            window_end = later[0]
+            others = [o for o, od in released.items()
+                      if o != rid and c <= float(od["released"].get("t", 0)) <= window_end]
+            if not others:
+                correlated = True
+    return {"released": len(released), "ambiguous": ambiguous, "correlated": correlated,
+            "approved": bool(clicks) and bool(released), "confirmed": bool(confirms)}
 
 
 _SECRET_ENV_RE = re.compile(r"(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.IGNORECASE)
 _AGENT_AUTH_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
-def agent_env() -> dict:
-    """Environment for the agent process: no ApplyPilot / third-party secrets.
+_AGENT_ENV_ALLOW = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "OS", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "USERNAME", "USER", "LOGNAME",
+    "LANG", "LANGUAGE", "TZ", "TERM", "SHELL", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR",
+})
 
-    Only Claude Code's own authentication variables survive; LLM keys loaded
-    from ApplyPilot's .env (Gemini, OpenAI, ...) and other secrets are dropped.
+
+def agent_env() -> dict:
+    """Minimal environment for the agent process (audit R10: an allowlist, not a denylist).
+
+    Only OS essentials, locale/proxy settings and Claude Code's own authentication variables
+    are passed; ApplyPilot settings, LLM keys from .env, data-directory paths and every other
+    variable are dropped.
     """
     env = {k: v for k, v in os.environ.items()
-           if k in _AGENT_AUTH_ENV or not _SECRET_ENV_RE.search(k)}
+           if k in _AGENT_AUTH_ENV or (k.upper() in _AGENT_ENV_ALLOW and not _SECRET_ENV_RE.search(k))
+           or k.upper().startswith("LC_")}
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     env.pop("APPLYPILOT_GMAIL_CREDENTIALS", None)
@@ -1138,8 +1205,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         returncode = proc.returncode
         proc = None
         # Quiesce before reading evidence (audit H3): no byte leaves the browser from here on,
-        # so the outcome is decided on a final record.
-        guard.seal()
+        # so the outcome is decided on a final record. An unconfirmed seal makes it uncertain (R4).
+        if not guard.seal() and not security_failure:
+            security_failure = "network guard seal could not be confirmed"
+
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)

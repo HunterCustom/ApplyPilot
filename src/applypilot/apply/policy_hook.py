@@ -28,6 +28,10 @@ GUARD_PREFIX = "DRY RUN GUARD"  # launcher recognises dry-run guard blocks by th
 POLICY_PREFIX = "APPLYPILOT POLICY"
 
 _PAGE_URL_RE = re.compile(r"Page URL:\s*(\S+)")
+# Tools whose output is the page itself (snapshot / navigation results); other tool output is
+# never accepted as confirmation evidence (audit R4).
+OBSERVATION_TOOLS = frozenset({"browser_snapshot", "browser_navigate", "browser_wait_for",
+                               "browser_click", "browser_press_key", "browser_navigate_back"})
 CONFIRMATION_RE = re.compile(
     r"thank you for (your )?appl|application (has been |was )?(received|submitted|complete)|"
     r"successfully (submitted|applied)|we('ve| have) received your application",
@@ -130,10 +134,20 @@ def handle_pre(policy: P.SessionPolicy, event: dict) -> int:
         submit = _is_submit_like(tool, tool_input)
         if submit:
             if wait_for_approval(policy, submit, tool_input if isinstance(tool_input, dict) else None):
-                P.record_audit(policy, {"phase": "pre", "tool": tool, "decision": "allow",
-                                        "submit_approved": True, "id": event.get("tool_use_id")})
-                return 0
-            allow, reason, terminal = False, f"{submit}: not approved by a human; output RESULT:FAILED:submit_not_approved", False
+                # Audit R7: the world may have changed while the human decided. Re-check the
+                # policy decision, the network guard and the session state before allowing.
+                re_allow, re_reason, _t = decide_pre(policy, tool, tool_input)
+                stale = (None if re_allow else re_reason) or P.network_guard_problem(policy) or (
+                    "session halted by a policy violation" if P.session_halted(policy) else None)
+                if stale is None:
+                    P.record_audit(policy, {"phase": "pre", "tool": tool, "decision": "allow",
+                                            "submit_approved": True, "id": event.get("tool_use_id")})
+                    return 0
+                reason = f"{submit}: approval no longer valid ({stale}); output RESULT:FAILED:submit_not_approved"
+                allow, terminal = False, True
+            else:
+                allow, reason, terminal = False, f"{submit}: not approved by a human; output RESULT:FAILED:submit_not_approved", False
+
     P.record_audit(policy, {"phase": "pre", "tool": tool, "decision": "allow" if allow else "deny",
                             "reason": reason[:160], "host": host, "id": event.get("tool_use_id")})
     if allow:
@@ -175,11 +189,13 @@ def handle_post(policy: P.SessionPolicy, event: dict) -> int:
         print(json.dumps({"decision": "block",
                           "reason": f"{POLICY_PREFIX}: {bad}. Stop now and output RESULT:FAILED:policy_violation"}))
         return 0
-    if not policy.dry_run and CONFIRMATION_RE.search(text):
-        # Only after the launcher released a human-approved write (audit H3); the launcher still
-        # checks the order (approved submit -> release -> this confirmation) before trusting it.
-        released = any(r.get("net_release") == "released" for r in P.read_jsonl(policy.dir / "audit.jsonl"))
-        if released:
+    if not policy.dry_run and tool.split("__")[-1] in OBSERVATION_TOOLS and CONFIRMATION_RE.search(text):
+        # Only page observations (not arbitrary tool output), and only after the server answered a
+        # released, human-approved write with 2xx/3xx (audit R4). The launcher still correlates the
+        # request ids and order before trusting it.
+        answered = any(r.get("net_release") == "response" and isinstance(r.get("status"), int)
+                       and 200 <= r["status"] < 400 for r in P.read_jsonl(policy.dir / "audit.jsonl"))
+        if answered:
             P.record_audit(policy, {"phase": "post", "tool": tool, "evidence": "confirmation_text",
                                     "id": event.get("tool_use_id")})
 

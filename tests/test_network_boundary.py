@@ -285,13 +285,20 @@ class HookGuardTests(TempDirCase):
         ev = launcher.submission_evidence(self.tmp)
         self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"]), (False, True, False))
         # a grant alone is not a release, and a confirmation seen *before* the release proves nothing
-        P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True})
-        P.record_audit(pol, {"phase": "network", "net_release": "released"})
+        P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True, "request_id": "r1",
+                             "requested_at": time.time()})
+        P.record_audit(pol, {"phase": "network", "net_release": "released", "request_id": "r1"})
         ev = launcher.submission_evidence(self.tmp)
         self.assertEqual((ev["approved"], ev["released"], ev["correlated"]), (True, 1, False))
+        self.assertEqual(ev["ambiguous"], 1)  # released, but no server response observed yet
         time.sleep(0.01)
         P.record_audit(pol, {"phase": "post", "tool": "x", "evidence": "confirmation_text"})
-        self.assertTrue(launcher.submission_evidence(self.tmp)["correlated"])
+        self.assertFalse(launcher.submission_evidence(self.tmp)["correlated"])  # no response: not proof
+        P.record_audit(pol, {"phase": "network", "net_release": "response", "request_id": "r1", "status": 201})
+        time.sleep(0.01)
+        P.record_audit(pol, {"phase": "post", "tool": "x", "evidence": "confirmation_text"})
+        ev = launcher.submission_evidence(self.tmp)
+        self.assertEqual((ev["correlated"], ev["ambiguous"]), (True, 0))
 
 
 
@@ -806,6 +813,16 @@ class BrowserBoundaryTests(TempDirCase):
         ev = launcher.submission_evidence(self.tmp)
         self.assertEqual((ev["released"], ev["ambiguous"]), (1, 0))
         self.assertEqual(self.app_hits.count("POST", "/apply-js"), 1)
+        # Audit R4: the attempt is journaled before the release and the server's real answer to
+        # exactly this request is captured (interceptResponse), all bound by one request id.
+        audit = P.read_jsonl(self.tmp / "audit.jsonl")
+        stages = [(r["net_release"], r.get("request_id")) for r in audit if r.get("net_release")]
+        self.assertEqual([s for s, _ in stages], ["release_attempt", "released", "response"])
+        self.assertEqual(len({rid for _, rid in stages}), 1)
+        response = next(r for r in audit if r.get("net_release") == "response")
+        self.assertIsInstance(response.get("status"), int)
+        grant = next(r for r in audit if r.get("net_approved"))
+        self.assertEqual(grant["request_id"], stages[0][1])
 
     def test_lost_controller_connection_fails_closed(self):
 

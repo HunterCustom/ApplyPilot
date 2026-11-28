@@ -71,6 +71,7 @@ class FakeGuard:
 
     def seal(self):
         self.sealed = True
+        return True
 
 
     def activate(self, policy, port):
@@ -332,13 +333,23 @@ class SubmitApprovalTests(TempDirCase):
         # request, and confirmation text only counts when it is seen after that release (audit H3)
         ev = launcher.submission_evidence(self.tmp)
         self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"]), (False, False, False))
-        P.record_audit(pol, {"phase": "network", "net_release": "released"})
+        # Full causal chain (audit R4): approval requested after the click, release journaled,
+        # released, server answered 2xx, then the page confirmation.
+        now = time.time()
+        P.record_audit(pol, {"phase": "network", "net_approved": True, "request_id": "r1", "requested_at": now})
+        for stage in ("release_attempt", "released"):
+            P.record_audit(pol, {"phase": "network", "net_release": stage, "request_id": "r1"})
+        with mock.patch("sys.stdout", io.StringIO()):  # a confirmation before the response is not evidence
+            policy_hook.handle_post(pol, {"tool_name": PW + "browser_snapshot",
+                                          "tool_response": "Thank you for applying! - Page URL: https://careers.acme-corp.com/done"})
+        self.assertFalse(launcher.submission_evidence(self.tmp)["confirmed"])
+        P.record_audit(pol, {"phase": "network", "net_release": "response", "request_id": "r1", "status": 200})
         time.sleep(0.01)
         with mock.patch("sys.stdout", io.StringIO()):
             policy_hook.handle_post(pol, {"tool_name": PW + "browser_snapshot",
                                           "tool_response": "Thank you for applying! - Page URL: https://careers.acme-corp.com/done"})
         ev = launcher.submission_evidence(self.tmp)
-        self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"]), (True, True, True))
+        self.assertEqual((ev["approved"], ev["confirmed"], ev["correlated"], ev["ambiguous"]), (True, True, True, 0))
 
 
 class CliSubmissionGateTests(TempDirCase):

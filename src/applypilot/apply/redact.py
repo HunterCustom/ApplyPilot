@@ -27,6 +27,9 @@ _SENSITIVE_KEYS = {
 }
 
 
+# Short mixed letter+digit segments (>= 6 chars) can be one-time tokens or ids (audit R10). Purely
+# numeric ids and ordinary words stay readable; requisition-style ids are masked in displays only.
+_SHORT_TOKEN_RE = re.compile(r"^(?=[^/]*[A-Za-z])(?=[^/]*\d)[A-Za-z0-9_\-.=~%+]{6,}$")
 _TOKENISH_RE = re.compile(r"^(?=.*\d)[A-Za-z0-9_\-.=~%+]{20,}$|^[A-Fa-f0-9-]{24,}$")
 
 
@@ -40,7 +43,8 @@ def safe_url(url: str, limit: int = 200) -> str:
         port = f":{p.port}" if p.port else ""
     except ValueError:
         return "(unparseable)"
-    segs = ["[token]" if _TOKENISH_RE.match(s) or _EMAIL_RE.search(s) else s for s in p.path.split("/")]
+    segs = ["[token]" if _TOKENISH_RE.match(s) or _EMAIL_RE.search(s) or _SHORT_TOKEN_RE.match(s) else s
+            for s in p.path.split("/")]
     return urlunsplit((p.scheme, host + port, "/".join(segs), "", ""))[:limit]
 
 

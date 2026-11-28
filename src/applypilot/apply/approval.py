@@ -13,10 +13,16 @@ Flow (all files inside the session directory, which the agent cannot reach):
    was made before the request expired. The nonce is then recorded as used and
    both files are deleted, so a grant can never be replayed.
 
-Every state transition is an atomic exclusive file creation (``O_EXCL`` /
-rename-without-replace), so two concurrent consumers or granters cannot both
-succeed, and withdrawal (expiry / cancellation) is irreversible: a withdrawn
-nonce can never be granted or consumed afterwards.
+Every state transition is an atomic exclusive file creation (``O_EXCL`` marker or a
+hard link, which never replaces an existing file on Windows or POSIX), so two concurrent
+consumers or granters cannot both succeed, and withdrawal (expiry / cancellation) is
+irreversible: a withdrawn nonce can never be granted or consumed afterwards.
+
+Audit R7: the exclusive ``used`` marker is the single commit point of a consumption. Deleting
+request/grant files and appending to the ledger happen afterwards and are best-effort: a
+Windows sharing violation (another process still reading a file) can neither raise through
+the winner nor turn a committed consumption into a lost authorization. Leftover files are
+inert because every reader checks the markers first.
 """
 from __future__ import annotations
 
@@ -69,6 +75,14 @@ def _claim(path: Path) -> bool:
     return True
 
 
+def _unlink_quietly(path: Path) -> None:
+    """Best-effort cleanup: never raises (WinError 32 while another process reads the file)."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _closed(session_dir: Path, nonce: str) -> bool:
     return (_marker(session_dir, nonce, "used").exists() or _marker(session_dir, nonce, "cancelled").exists()
             or nonce in _used(session_dir))
@@ -111,8 +125,17 @@ def display_action(action: dict) -> dict:
         out["url"] = safe_url(str(action["url"]))
     inp = action.get("input")
     if isinstance(inp, dict) and inp.get("element"):
-        out["element"] = str(inp["element"])[:80]
+        out["element"] = _safe_label(str(inp["element"]))
     return out
+
+
+_LABEL_PII_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|\+?\d[\d\s().-]{6,}\d|\b(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{6,}\b")
+
+
+def _safe_label(label: str) -> str:
+    """Page-derived element label for display: emails, phone-like digit runs and token-like words
+    are masked (audit R10); the human still sees the control's wording."""
+    return _LABEL_PII_RE.sub("[masked]", label)[:80]
 
 
 def create_request(session_dir: Path, *, kind: str, job_url: str, action: dict,
@@ -156,12 +179,15 @@ def grant(session_dir: Path, nonce: str, now: float | None = None, expected_dige
         "nonce": nonce, "session_id": req["session_id"], "job": req.get("job"),
         "digest": req.get("digest"), "granted_at": now}), encoding="utf-8")
     try:
-        os.rename(tmp, _grant_path(session_dir, nonce))  # never replaces an existing grant
+        # A hard link publishes the complete file atomically and fails if a grant already exists
+        # (os.rename would silently replace it on POSIX).
+        os.link(tmp, _grant_path(session_dir, nonce))
     except OSError:
-        tmp.unlink(missing_ok=True)
         return False
+    finally:
+        _unlink_quietly(tmp)
     if _closed(session_dir, nonce):  # withdrawn while we were granting: the grant is void
-        _grant_path(session_dir, nonce).unlink(missing_ok=True)
+        _unlink_quietly(_grant_path(session_dir, nonce))
         return False
     return True
 
@@ -191,20 +217,26 @@ def consume(session_dir: Path, nonce: str, *, job_url: str, digest: str,
     if not _claim(_marker(session_dir, nonce, "used")):
         return False  # a concurrent consumer won, or the request was withdrawn
     if _marker(session_dir, nonce, "cancelled").exists():
-        return False
-    with open(session_dir / USED_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"nonce": nonce, "kind": req.get("kind"), "t": now}) + "\n")
+        return False  # withdrawn in the same instant: fail closed (never a double outcome)
+    # Committed. Everything below is bookkeeping and must not change the outcome.
+    try:
+        with open(session_dir / USED_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"nonce": nonce, "kind": req.get("kind"), "t": now}) + "\n")
+    except OSError:
+        pass
     withdraw(session_dir, nonce)
     return True
 
 
 def withdraw(session_dir: Path, nonce: str) -> None:
-    """Close a request for good (expiry / cancellation / after use) and delete its files."""
+    """Close a request for good (expiry / cancellation / after use) and delete its files.
+
+    The marker is the committed state; file deletion is best-effort and never raises."""
     if valid_nonce(nonce):
         if not _marker(Path(session_dir), nonce, "used").exists():
             _claim(_marker(Path(session_dir), nonce, "cancelled"))
-        _req_path(Path(session_dir), nonce).unlink(missing_ok=True)
-        _grant_path(Path(session_dir), nonce).unlink(missing_ok=True)
+        _unlink_quietly(_req_path(Path(session_dir), nonce))
+        _unlink_quietly(_grant_path(Path(session_dir), nonce))
 
 
 def cancel_all(session_dir: Path) -> int:
@@ -217,8 +249,9 @@ def cancel_all(session_dir: Path) -> int:
             withdraw(Path(session_dir), nonce)
             n += 1
     for p in d.glob("grant-*.json") if d.exists() else []:
-        p.unlink(missing_ok=True)
+        _unlink_quietly(p)
     return n
+
 
 
 def wait_for_grant(session_dir: Path, req: dict, *, poll_s: float = 1.0,

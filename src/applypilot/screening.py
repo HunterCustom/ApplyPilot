@@ -111,6 +111,12 @@ def load_bank(path: Path | None = None) -> list[Entry]:
     return out
 
 
+def entry_is_sensitive(entry: Entry) -> bool:
+    """True if a bank entry is about a sensitive category (by its id, question or patterns)."""
+    texts = [entry.question, entry.id.replace("_", " ")] + [p.pattern for p in entry.patterns]
+    return any(sensitive_category(t) for t in texts if t)
+
+
 def sensitive_category(question: str) -> str | None:
     for cat, rx in _SENS_RE.items():
         if rx.search(question or ""):
@@ -157,7 +163,9 @@ def coverage(bank: list[Entry] | None = None) -> dict:
 def agent_section(bank: list[Entry] | None = None) -> str:
     """Prompt block for the apply agent: verified reusable answers + the stop rules."""
     bank = load_bank() if bank is None else bank
-    usable = [e for e in bank if e.reusable]
+    # A sensitive answer reaches the agent only with explicit per-question authorization (audit R10):
+    # the category is judged from the entry itself (id, question and patterns), not only at decide().
+    usable = [e for e in bank if e.reusable and (e.sensitive_ok or not entry_is_sensitive(e))]
     lines = ["== SCREENING QUESTIONS (verified answers only) ==",
              "Use ONLY these candidate-approved answers. Match the question's meaning, not just its words."]
     for e in usable:

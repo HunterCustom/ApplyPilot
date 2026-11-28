@@ -100,6 +100,7 @@ class BrowserController:
         self.form_navs: dict[tuple[str, str], tuple[float, str]] = {}  # (frameId, url) -> (t, reason)
         self.paused_urls: list[str] = []          # recorded only during the self-test
         self.selftest_urls: set[str] = set()
+        self.released: dict[str, dict] = {}       # requestId -> approved action awaiting its response
 
     # --- lifecycle ---------------------------------------------------------------
     async def start(self, cdp_port: int) -> None:
@@ -247,6 +248,15 @@ class BrowserController:
     async def _on_paused(self, params: dict, sid: str | None) -> None:
         req = params.get("request", {})
         rid = params["requestId"]
+        if "responseStatusCode" in params or "responseErrorReason" in params:
+            # Response stage: only requested (interceptResponse) for a human-approved, released
+            # write. It is inbound data; record the server's answer as evidence and let it through.
+            action = self.released.pop(rid, None)
+            if action is not None:
+                self.guard.record_release(action, "response", status=params.get("responseStatusCode"),
+                                          error=params.get("responseErrorReason"))
+            await self._continue(rid, sid)
+            return
         url, method = req.get("url", ""), req.get("method", "GET")
         rtype = params.get("resourceType", "Other")
         info = self.sessions.get(sid or "", {})
@@ -307,9 +317,13 @@ class BrowserController:
                 return
             ok = await self.guard.request_approval(action, reason)
             if ok and not self.guard.failed.is_set() and sid in self.sessions:
+                # Journal the attempt *before* Chrome may send the bytes (audit R4): a crash after
+                # this point leaves an unresolved attempt, which is never read as success.
+                self.guard.record_release(action, "release_attempt")
+                self.released[rid] = action
                 self.guard.proxy.release()
                 released = True
-                ok_sent = await self._continue(rid, sid)
+                ok_sent = await self._continue(rid, sid, intercept_response=True)
                 self.guard.record_release(action, "released" if ok_sent else "release_unconfirmed")
             else:
                 await self._fail(rid, sid)
@@ -317,11 +331,15 @@ class BrowserController:
             if not released:
                 self.guard.proxy.release()
 
-    async def _continue(self, rid: str, sid: str | None) -> bool:
+    async def _continue(self, rid: str, sid: str | None, intercept_response: bool = False) -> bool:
+        params: dict = {"requestId": rid}
+        if intercept_response:
+            params["interceptResponse"] = True  # pause again at the response: causal evidence
         try:
-            await self.conn.send("Fetch.continueRequest", {"requestId": rid}, sid)
+            await self.conn.send("Fetch.continueRequest", params, sid)
             return True
         except CDPError:
+            self.released.pop(rid, None)
             return False  # request already gone (tab closed / navigation cancelled) or unknown
 
     async def _fail(self, rid: str, sid: str | None) -> bool:
@@ -444,15 +462,25 @@ class NetworkGuard:
                 except Exception:
                     logger.exception("network guard failure callback failed")
 
-    def record_release(self, action: dict, outcome: str) -> None:
-        """Launcher-side evidence that a human-approved write was handed back to Chrome."""
+    def record_release(self, action: dict, outcome: str, status: int | None = None,
+                       error: str | None = None) -> None:
+        """Launcher-side evidence for one human-approved write (audit R4).
+
+        Outcomes, in order: ``release_attempt`` (journaled before Chrome may send it), then
+        ``released`` / ``release_unconfirmed``, then ``response`` with the server's status."""
         pol = self.policy
         if pol is None:
             return
-        P.record_audit(pol, {"phase": "network", "net_release": outcome, "t": time.time(),
-                             "request_id": action.get("request_id"), "target_id": action.get("target_id"),
-                             "frame_id": action.get("frame_id"), "method": action.get("method"),
-                             "host": P.normalize_host(urlsplit(action.get("url") or "").hostname)})
+        rec = {"phase": "network", "net_release": outcome, "t": time.time(),
+               "request_id": action.get("request_id"), "target_id": action.get("target_id"),
+               "frame_id": action.get("frame_id"), "method": action.get("method"),
+               "host": P.normalize_host(urlsplit(action.get("url") or "").hostname),
+               "approval_nonce": action.get("approval_nonce")}
+        if status is not None:
+            rec["status"] = int(status)
+        if error:
+            rec["error"] = str(error)[:80]
+        P.record_audit(pol, rec)
 
     async def request_approval(self, action: dict, reason: str) -> bool:
         pol = self.policy
@@ -468,8 +496,10 @@ class NetworkGuard:
         try:
             while time.time() <= req["expires"] and not self.failed.is_set():
                 if approval.consume(pol.dir, req["nonce"], job_url=req["job_url"], digest=req["digest"]):
+                    action["approval_nonce"] = req["nonce"]
                     P.record_audit(pol, {"phase": "network", "decision": "granted", "net_approved": True,
-                                         "nonce": req["nonce"], "t": time.time()})
+                                         "nonce": req["nonce"], "request_id": action.get("request_id"),
+                                         "requested_at": req["created"], "t": time.time()})
                     return True
                 await asyncio.sleep(0.5)
         finally:
@@ -500,12 +530,18 @@ class NetworkGuard:
         status.write_text(json.dumps({"active": True, "selftest": "ok", "proxy_port": self.proxy_port,
                                       "t": time.time()}), encoding="utf-8")
 
-    def seal(self) -> None:
-        """End of the agent session: cut all egress for good before the outcome is recorded."""
+    def seal(self) -> bool:
+        """End of the agent session: cut all egress for good before the outcome is recorded.
+
+        Returns False if sealing could not be confirmed; the caller must then treat the outcome
+        as uncertain (audit R4) -- a session whose egress may still be open proves nothing."""
         try:
             self._run(self._seal(), 5)
         except Exception:
-            logger.debug("network guard seal error", exc_info=True)
+            logger.warning("network guard seal failed", exc_info=True)
+            return False
+        return bool(getattr(self.proxy, "revoked", False))
+
 
     async def _seal(self) -> None:
         self.proxy.revoke()

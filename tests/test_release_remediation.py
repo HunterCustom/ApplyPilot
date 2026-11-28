@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -733,6 +734,364 @@ class DailyRunTests(TempEnv):
         self.assertEqual(daily.run_daily(plan_only=True), daily.EXIT_OK)
         self.assertFalse(self.db_path.exists())
         self.assertIn("dedupe", opsconfig.DAILY_STAGES)
+
+
+
+# --- R7: approvals --------------------------------------------------------------------------------------
+
+from applypilot.apply import approval, policy_hook
+from applypilot.apply import policy as P
+
+APPROVAL_JOB = "https://careers.acme-corp.com/jobs/42"
+
+_CONSUMER = r"""
+import json, sys, time
+from pathlib import Path
+from applypilot.apply import approval
+session, nonce, digest, job, start = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5])
+while time.time() < start:
+    time.sleep(0.001)
+try:
+    print(json.dumps({"won": approval.consume(session, nonce, job_url=job, digest=digest)}), flush=True)
+except Exception as e:
+    print(json.dumps({"error": f"{type(e).__name__}: {e}"}), flush=True)
+"""
+
+
+class ApprovalCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def req(self):
+        return approval.create_request(self.tmp, kind="network", job_url=APPROVAL_JOB,
+                                       action={"method": "POST", "url": APPROVAL_JOB, "body_sha256": "ab"}, ttl_s=60)
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
+    def test_sharing_violation_during_cleanup_does_not_lose_the_approval(self):
+        """Audit reproduction: the winner created the used marker, then WinError 32 in cleanup made it lose."""
+        req = self.req()
+        self.assertTrue(approval.grant(self.tmp, req["nonce"]))
+        grant_file = self.tmp / "approvals" / f"grant-{req['nonce']}.json"
+        with open(grant_file, encoding="utf-8"):  # another reader: Windows refuses deletion (WinError 32)
+            with self.assertRaises(PermissionError):
+                os.unlink(grant_file)  # positive control: the sharing violation is real
+            self.assertTrue(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+            self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+        self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+
+    def test_concurrent_processes_exactly_one_wins_and_none_fails(self):
+        for _ in range(3):
+            req = self.req()
+            self.assertTrue(approval.grant(self.tmp, req["nonce"]))
+            start = time.time() + 1.5
+            procs = [subprocess.Popen([sys.executable, "-c", _CONSUMER, str(self.tmp), req["nonce"], req["digest"],
+                                       APPROVAL_JOB, str(start)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      text=True) for _ in range(6)]
+            res = [json.loads(p.communicate(timeout=60)[0].strip()) for p in procs]
+            self.assertFalse([r for r in res if "error" in r], res)
+            self.assertEqual(sum(r["won"] for r in res), 1, res)
+
+    def test_grant_never_replaces_an_existing_grant(self):
+        req = self.req()
+        gpath = self.tmp / "approvals" / f"grant-{req['nonce']}.json"
+        gpath.parent.mkdir(parents=True, exist_ok=True)
+        gpath.write_text(json.dumps({"nonce": req["nonce"], "forged": True}), encoding="utf-8")
+        self.assertFalse(approval.grant(self.tmp, req["nonce"]))
+        self.assertTrue(json.loads(gpath.read_text(encoding="utf-8"))["forged"])  # not overwritten
+        self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+
+    def test_concurrent_grant_and_cancel_never_leave_a_usable_grant(self):
+        for _ in range(20):
+            req = self.req()
+            barrier = threading.Barrier(2)
+
+            def g(r=req, b=barrier):
+                b.wait()
+                approval.grant(self.tmp, r["nonce"])
+
+            def c(b=barrier):
+                b.wait()
+                approval.cancel_all(self.tmp)
+            ts = [threading.Thread(target=g), threading.Thread(target=c)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            approval.cancel_all(self.tmp)
+            self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+
+    def test_approval_is_bound_to_session_job_and_action(self):
+        req = self.req()
+        self.assertTrue(approval.grant(self.tmp, req["nonce"]))
+        other_session = Path(tempfile.mkdtemp())
+        self.assertFalse(approval.consume(other_session, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+        self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB + "x", digest=req["digest"]))
+        self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest="0" * 64))
+        self.assertFalse(approval.grant(self.tmp, req["nonce"], expected_digest="0" * 64) and False)
+        self.assertTrue(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+
+    def test_expired_request_is_never_consumed(self):
+        req = approval.create_request(self.tmp, kind="network", job_url=APPROVAL_JOB, action={"m": 1}, ttl_s=60,
+                                      now=time.time() - 120)
+        self.assertFalse(approval.grant(self.tmp, req["nonce"]))
+        self.assertFalse(approval.consume(self.tmp, req["nonce"], job_url=APPROVAL_JOB, digest=req["digest"]))
+
+
+class ClickApprovalRecheckTests(unittest.TestCase):
+    """Audit R7: the click hook returned allow after the wait without rechecking guard state."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.pol = P.SessionPolicy(session_dir=str(self.tmp), dry_run=False, upload_paths=[], job_url=APPROVAL_JOB,
+                                   allowed_hosts=["*.acme-corp.com"])
+        self.pol.write()
+        (self.tmp / P.GUARD_STATUS_FILE).write_text(json.dumps({"active": True, "selftest": "ok"}), encoding="utf-8")
+
+    def submit_event(self):
+        return {"tool_name": "mcp__playwright__browser_click", "tool_use_id": "t1",
+                "tool_input": {"element": "Submit application button", "ref": "e12"}}
+
+    def test_guard_failure_during_the_wait_denies_the_click(self):
+        def approve_but_guard_fails(*a, **k):
+            (self.tmp / P.GUARD_FAILED_FILE).write_text("lost", encoding="utf-8")
+            return True
+        with mock.patch.object(policy_hook, "wait_for_approval", side_effect=approve_but_guard_fails):
+            self.assertEqual(policy_hook.handle_pre(self.pol, self.submit_event()), 2)
+        audit = P.read_jsonl(self.tmp / "audit.jsonl")
+        self.assertFalse(any(r.get("submit_approved") for r in audit))
+
+    def test_halting_violation_during_the_wait_denies_the_click(self):
+        def approve_but_halt(*a, **k):
+            P.record_violation(self.pol, "browser_navigate", "left approved sites", terminal=True)
+            return True
+        with mock.patch.object(policy_hook, "wait_for_approval", side_effect=approve_but_halt):
+            self.assertEqual(policy_hook.handle_pre(self.pol, self.submit_event()), 2)
+
+    def test_unchanged_state_allows_the_approved_click(self):
+        with mock.patch.object(policy_hook, "wait_for_approval", return_value=True):
+            self.assertEqual(policy_hook.handle_pre(self.pol, self.submit_event()), 0)
+
+
+
+# --- R4: causal submission evidence ---------------------------------------------------------------------
+
+import test_apply_security as _tas
+
+PW = _tas.PW
+
+
+class CausalEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.pol = P.SessionPolicy(session_dir=str(self.tmp), dry_run=False, upload_paths=[], job_url=APPROVAL_JOB,
+                                   allowed_hosts=["*.acme-corp.com"])
+        self.pol.write()
+
+    def rec(self, **r):
+        time.sleep(0.002)  # strictly increasing record times
+        P.record_audit(self.pol, {"phase": "network", **r})
+
+    def click(self):
+        time.sleep(0.002)
+        P.record_audit(self.pol, {"phase": "pre", "tool": "browser_click", "decision": "allow", "submit_approved": True})
+        return time.time()
+
+    def write(self, rid, status=200, requested_at=None):
+        self.rec(net_approved=True, request_id=rid, requested_at=requested_at or time.time())
+        self.rec(net_release="release_attempt", request_id=rid)
+        self.rec(net_release="released", request_id=rid)
+        if status is not None:
+            self.rec(net_release="response", request_id=rid, status=status)
+
+    def confirm(self):
+        time.sleep(0.002)
+        P.record_audit(self.pol, {"phase": "post", "tool": "browser_snapshot", "evidence": "confirmation_text"})
+
+    def ev(self):
+        return launcher.submission_evidence(self.tmp)
+
+    def test_audit_case_click_other_request_unrelated_confirmation(self):
+        """Audit reproduction: approved click + a *different* request + unrelated later confirmation."""
+        before = time.time()
+        self.write("other", requested_at=before - 5)   # its approval was requested before the click
+        self.click()
+        self.confirm()
+        self.assertFalse(self.ev()["correlated"])
+
+    def test_full_chain_correlates(self):
+        self.click()
+        self.write("r1")
+        self.confirm()
+        ev = self.ev()
+        self.assertEqual((ev["correlated"], ev["released"], ev["ambiguous"]), (True, 1, 0))
+
+    def test_error_response_does_not_correlate(self):
+        self.click()
+        self.write("r1", status=422)
+        self.confirm()
+        self.assertFalse(self.ev()["correlated"])
+
+    def test_missing_response_is_ambiguous_not_success(self):
+        self.click()
+        self.write("r1", status=None)
+        self.confirm()
+        ev = self.ev()
+        self.assertEqual((ev["correlated"], ev["ambiguous"]), (False, 1))
+
+    def test_two_writes_in_the_window_are_not_attributable(self):
+        self.click()
+        self.write("r1")
+        self.write("r2")
+        self.confirm()
+        self.assertFalse(self.ev()["correlated"])
+
+    def test_confirmation_before_the_response_does_not_count(self):
+        self.click()
+        self.rec(net_approved=True, request_id="r1", requested_at=time.time())
+        self.rec(net_release="release_attempt", request_id="r1")
+        self.rec(net_release="released", request_id="r1")
+        self.confirm()
+        self.rec(net_release="response", request_id="r1", status=200)
+        self.assertFalse(self.ev()["correlated"])
+
+    def test_journaled_attempt_without_outcome_is_ambiguous(self):
+        """A crash between the journal entry and the release outcome must never read as clean."""
+        self.click()
+        self.rec(net_approved=True, request_id="r1", requested_at=time.time())
+        self.rec(net_release="release_attempt", request_id="r1")
+        ev = self.ev()
+        self.assertEqual((ev["ambiguous"], ev["correlated"]), (1, False))
+        result = launcher.classify_session("RESULT:FAILED:form_error", final_is_error=False, dry_run=False,
+                                           submit_attempts=1, unblocked_submits=1, tool_uses=3,
+                                           submit_approved=True, released_writes=ev["released"],
+                                           ambiguous_writes=ev["ambiguous"], evidence_correlated=ev["correlated"])
+        self.assertTrue(result.startswith("uncertain:"), result)
+
+    def test_agent_claim_of_applied_without_causal_evidence_is_uncertain(self):
+        self.click()
+        self.write("r1", status=500)
+        self.confirm()
+        ev = self.ev()
+        result = launcher.classify_session("RESULT:APPLIED", final_is_error=False, dry_run=False, submit_attempts=1,
+                                           unblocked_submits=1, tool_uses=3, submit_approved=ev["approved"],
+                                           confirmation_seen=ev["confirmed"], released_writes=ev["released"],
+                                           ambiguous_writes=ev["ambiguous"], evidence_correlated=ev["correlated"])
+        self.assertEqual(result, "uncertain:applied_without_evidence")
+
+
+class HookConfirmationTests(unittest.TestCase):
+    """Audit R4: a confirmation-like phrase in any tool output after any released write was evidence."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.pol = P.SessionPolicy(session_dir=str(self.tmp), dry_run=False, upload_paths=[], job_url=APPROVAL_JOB,
+                                   allowed_hosts=["*.acme-corp.com"])
+        self.pol.write()
+
+    def post(self, tool, text):
+        with mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()):
+            policy_hook.handle_post(self.pol, {"tool_name": PW + tool, "tool_response": text})
+        return any(r.get("evidence") == "confirmation_text" for r in P.read_jsonl(self.tmp / "audit.jsonl"))
+
+    def test_released_write_without_response_gives_no_evidence(self):
+        P.record_audit(self.pol, {"phase": "network", "net_release": "released", "request_id": "r1"})
+        self.assertFalse(self.post("browser_snapshot", "Thank you for applying!"))
+
+    def test_non_observation_tool_output_is_never_evidence(self):
+        P.record_audit(self.pol, {"phase": "network", "net_release": "response", "request_id": "r1", "status": 200})
+        self.assertFalse(self.post("browser_evaluate", "Thank you for applying!"))
+        self.assertFalse(self.post("browser_fill_form", "Thank you for applying!"))
+        self.assertTrue(self.post("browser_snapshot", "Thank you for applying!"))
+
+
+class SealFailureTests(_tas.TempDirCase):
+    run_job = _tas.RunJobTests.run_job
+
+    def test_unconfirmed_seal_makes_the_outcome_uncertain(self):
+        class Unsealed(_tas.FakeGuard):
+            def seal(self):
+                self.sealed = True
+                return False
+
+        def setup(session):
+            (session / "hook_alive").write_text("1")
+            pol = P.SessionPolicy.load(session / "policy.json")
+            P.record_audit(pol, {"phase": "pre", "tool": PW + "browser_navigate", "decision": "allow", "id": "t1"})
+
+        tool = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": PW + "browser_navigate",
+             "input": {"url": "https://careers.acme-corp.com/jobs/42"}}]}}
+        result, _killed, _ = self.run_job([dict(_tas.InitEventTests.GOOD), tool, {"type": "result", "result": "RESULT:DRY_RUN"}],
+                                          setup, Unsealed())
+        self.assertTrue(result.startswith("uncertain:"), result)
+
+
+
+# --- R10: screening prompt, displays, secrets, environment ---------------------------------------------
+
+from applypilot import screening
+from applypilot.apply import redact
+
+
+class SensitiveLeakTests(unittest.TestCase):
+    def test_reusable_sensitive_answer_without_authorization_never_reaches_the_prompt(self):
+        """Audit reproduction: a reusable sensitive answer without sensitive_ok appeared in the prompt."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "screening_answers.yaml"
+            p.write_text(textwrap.dedent("""
+                answers:
+                  - id: felony
+                    question: "Have you ever been convicted of a felony?"
+                    patterns: ["convicted"]
+                    answer: "SENSITIVE-MARKER-NO"
+                    reusable: true
+                  - id: veteran_status
+                    patterns: ["protected veteran"]
+                    answer: "SENSITIVE-MARKER-VET"
+                    reusable: true
+                  - id: eeo_decline
+                    question: "Gender / race self-identification"
+                    patterns: ["gender"]
+                    answer: "I don't wish to answer"
+                    reusable: true
+                    sensitive_ok: true
+                  - id: relocation
+                    patterns: ["relocat"]
+                    answer: "No"
+                    reusable: true
+            """), encoding="utf-8")
+            bank = screening.load_bank(p)
+        section = screening.agent_section(bank)
+        self.assertNotIn("SENSITIVE-MARKER", section)
+        self.assertIn("I don't wish to answer", section)  # explicitly authorized
+        self.assertIn("relocation: No", section)
+
+    def test_approval_display_masks_short_tokens_and_label_pii(self):
+        """Audit reproduction: a short URL path token and a raw page label survived the display serializer."""
+        action = {"method": "POST", "url": "https://careers.acme-corp.com/apply/ab12cd9/confirm?t=x",
+                  "input": {"element": "Send to testy.applicant@example.org / (919) 555-0142 ref Zx81kQ2pL"}}
+        shown = json.dumps(approval.display_action(action))
+        for leaked in ("ab12cd9", "testy.applicant@example.org", "555-0142", "Zx81kQ2pL", "t=x"):
+            self.assertNotIn(leaked, shown)
+        self.assertIn("confirm", shown)
+        self.assertIn("Send to", shown)
+        self.assertEqual(redact.safe_url("https://x.test/jobs/12345/apply"), "https://x.test/jobs/12345/apply")
+
+    def test_stale_verification_secrets_are_purged_at_startup(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(config, "APP_DIR", Path(d)):
+            stale = Path(d) / "apply-sessions" / "w0_old" / "secrets.txt"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("123456\n", encoding="utf-8")
+            self.assertEqual(launcher.purge_stale_secrets(), 1)
+            self.assertFalse(stale.exists())
+
+    def test_agent_environment_is_an_allowlist(self):
+        env = {"PATH": "p", "SYSTEMROOT": "C:/Windows", "ANTHROPIC_API_KEY": "a", "APPLYPILOT_DIR": "C:/data",
+               "LLM_URL": "http://127.0.0.1:1234", "GEMINI_API_KEY": "g", "RANDOM_TOOL_HOME": "x",
+               "AWS_PROFILE": "work", "HTTPS_PROXY": "http://proxy:8080", "LC_ALL": "C"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            out = launcher.agent_env()
+        self.assertEqual(set(out), {"PATH", "SYSTEMROOT", "ANTHROPIC_API_KEY", "HTTPS_PROXY", "LC_ALL"})
 
 
 if __name__ == "__main__":
