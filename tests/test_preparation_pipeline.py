@@ -310,7 +310,17 @@ class VerifyTests(TempEnv):
 # --- duplicates ------------------------------------------------------------------------------------------
 
 class DedupeTests(TempEnv):
+    def test_workday_requisitions_in_urls_keep_openings_apart(self):
+        base = "https://synth.wd5.myworkdayjobs.test/External/job/US-Raleigh/Implementation-Consultant_"
+        a = {"url": base + "JREQ204876", "company": "Synth", "title": "Implementation Consultant",
+             "location": "Raleigh, NC", "full_description": "same text " * 50, "strategy": "workday_api", "site": "x"}
+        b = {**a, "url": base + "JREQ203197", "strategy": "jobspy", "site": "indeed"}
+        self.assertEqual(dedupe.requisition_id(a), "JREQ204876")
+        self.assertIsNone(dedupe.same_opening(a, b))
+        self.assertIsNone(dedupe.requisition_id({"url": "https://www.indeed.com/viewjob?jk=12345678"}))
+
     def test_canonical_urls(self):
+
         a = dedupe.canonical_url("https://job-boards.greenhouse.io/acme/jobs/123?gh_src=abc&utm_source=x")
         b = dedupe.canonical_url("https://boards.greenhouse.io/acme/jobs/123/apply")
         self.assertEqual(a, b)
@@ -318,10 +328,14 @@ class DedupeTests(TempEnv):
     def test_rules(self):
         desc = "Provide desktop support for Windows 11 users, manage Active Directory and Intune. " * 8
         a = {"url": "u1", "company": "Synthetic Bank, Inc.", "title": "Sr. IT Support Specialist (Remote)",
-             "location": "Raleigh, NC", "full_description": desc}
+             "location": "Raleigh, NC", "full_description": desc, "strategy": "jobspy", "site": "indeed"}
         b = {"url": "u2", "company": "synthetic bank", "title": "Senior IT Support Specialist",
-             "location": "Raleigh, NC", "full_description": desc}
+             "location": "Raleigh, NC", "full_description": desc, "strategy": "workday_api", "site": "Synthetic Bank"}
         self.assertIsNotNone(dedupe.same_opening(a, b))
+        # same source, same title, different URLs: several openings, not a duplicate (real-data regression)
+        self.assertIsNone(dedupe.same_opening(a, {**b, "strategy": "jobspy", "site": "indeed"}))
+        # unknown location never matches on similarity
+        self.assertIsNone(dedupe.same_opening({**a, "location": None}, {**b, "location": None}))
         # same title, different openings (different requisition IDs) are never merged
         self.assertIsNone(dedupe.same_opening({**a, "requisition_id": "R-1001"}, {**b, "requisition_id": "R-1002"}))
         # same title without comparable descriptions: not merged
@@ -334,7 +348,7 @@ class DedupeTests(TempEnv):
     def test_run_keeps_rows_and_prefers_official_posting(self):
         desc = "Provide desktop support for Windows 11 users. " * 10
         self.add("https://www.indeed.com/viewjob?jk=9", application_url="https://www.indeed.com/viewjob?jk=9",
-                 full_description=desc)
+                 full_description=desc, site="indeed", strategy="jobspy")
         self.add("https://careers.synthbank.test/jobs/77", application_url="https://careers.synthbank.test/jobs/77",
                  full_description=desc)
         self.add("https://careers.synthbank.test/jobs/78", title="Network Engineer", full_description="other " * 50)

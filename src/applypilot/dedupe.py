@@ -37,9 +37,15 @@ _TITLE_ABBR = {"sr": "senior", "jr": "junior", "eng": "engineer", "engr": "engin
 _TRACKING = re.compile(r"^(utm_.*|gh_src|gh_jid_src|source|src|ref|referrer|lever-source|lever-origin|"
                        r"trk|trackingid|refid|codes|mode|jobsearch|sid|iis|iisn|ccuid|jobpipeline|"
                        r"bid|cid|campaign|_ga|fbclid|gclid|mc_cid|mc_eid)$", re.IGNORECASE)
+# Requisition IDs embedded in ATS URLs: Workday ".../Title_JREQ205631-1", ".../Title_R0012345",
+# iCIMS "/jobs/12345/...", Greenhouse "/jobs/4012345", Lever UUIDs. URL patterns are tried first.
+_URL_REQ_PATTERNS = (
+    re.compile(r"_([A-Z]{0,6}-?\d{4,12}(?:-\d{1,3})?)/?$", re.IGNORECASE),
+    re.compile(r"/jobs?/(\d{5,12})(?:[/?-]|$)", re.IGNORECASE),
+    re.compile(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/|$)", re.IGNORECASE),
+)
 _REQ_PATTERNS = (
     re.compile(r"\b(?:req(?:uisition)?|job)\s*(?:id|#|no\.?|number)?\s*[:#]?\s*([A-Z]{0,4}[-_]?\d{4,10})\b", re.IGNORECASE),
-    re.compile(r"_(R-?\d{4,10}|JR-?\d{4,10}|REQ-?\d{4,10})(?:[-_/?]|$)", re.IGNORECASE),
 )
 _HOST_ALIASES = {"job-boards.greenhouse.io": "boards.greenhouse.io", "jobs.ashbyhq.com": "jobs.ashbyhq.com"}
 _BOARD_HOSTS = ("indeed.com", "linkedin.com", "glassdoor.com", "ziprecruiter.com", "simplyhired.com",
@@ -94,12 +100,25 @@ def canonical_url(url: str | None) -> str:
 def requisition_id(job: dict) -> str | None:
     if job.get("requisition_id"):
         return str(job["requisition_id"]).upper().replace("_", "-")
-    for text in (job.get("application_url") or "", job.get("url") or "", (job.get("full_description") or "")[:4000]):
-        for pat in _REQ_PATTERNS:
-            m = pat.search(text)
+    for url in (job.get("application_url") or "", job.get("url") or ""):
+        host = (urlsplit(url).hostname or "").lower()
+        if any(host == h or host.endswith("." + h) for h in _BOARD_HOSTS):
+            continue  # a board's own listing id is not the employer's requisition
+        path = urlsplit(url).path
+        for pat in _URL_REQ_PATTERNS:
+            m = pat.search(path)
             if m:
                 return m.group(1).upper().replace("_", "-")
+    text = (job.get("full_description") or "")[:4000]
+    for pat in _REQ_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return m.group(1).upper().replace("_", "-")
     return None
+
+
+def _source(job: dict) -> str:
+    return f"{job.get('strategy') or ''}|{(job.get('site') or '').lower()}"
 
 
 def _shingles(text: str, n: int = 3) -> set[tuple[str, ...]]:
@@ -135,10 +154,17 @@ def same_opening(a: dict, b: dict) -> str | None:
     ra, rb = requisition_id(a), requisition_id(b)
     if ra and rb:
         return "same employer and requisition ID" if ra == rb else None
+    # Similar-text matching is a *cross-source* rule: one source listing the same title twice with
+    # different URLs usually means several openings (real data: one employer's Workday site had
+    # identical titles with different requisitions and cities).
+    if _source(a) == _source(b):
+        return None
     if norm_title(a.get("title")) != norm_title(b.get("title")):
         return None
-    if norm_location(a.get("location")) != norm_location(b.get("location")):
+    la, lb = norm_location(a.get("location")), norm_location(b.get("location"))
+    if not la or la != lb:
         return None
+
     ta, tb = (a.get("job_type") or "").lower(), (b.get("job_type") or "").lower()
     if ta and tb and ta != tb:
         return None
