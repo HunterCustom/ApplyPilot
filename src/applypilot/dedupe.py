@@ -7,14 +7,17 @@ source history and gets ``duplicate_of`` = the canonical row's URL plus a reason
 A pair is a duplicate only on strong evidence (conservative -- similar titles at one
 employer are often genuinely different openings):
 
-1. the same canonical application URL (tracking parameters, ``www.``, ATS host aliases
-   and ``/apply`` suffixes removed); or
+1. the same canonical *job-specific* URL -- posting or application URL, in either field
+   (tracking parameters, ``www.``, ATS host aliases and ``/apply`` suffixes removed; path
+   case and non-default ports kept; generic careers/search pages never count); or
 2. the same normalised employer and the same requisition ID; or
 3. the same normalised employer, title, location and employment type, **and** both
    descriptions present and near-identical (word-shingle Jaccard >= 0.85).
 
-Different requisition IDs always mean different openings. The canonical row is the one
-with an employer/ATS application URL, else an applied/claimed one, else the earliest seen.
+Different requisition IDs always mean different openings, even with a shared URL, and a
+group never joins two requisitions of one employer (such a merge is flagged for review).
+A row linked to a group with application history keeps the link. The canonical row is an
+applied/claimed one, else the employer's own posting, else the earliest seen.
 """
 from __future__ import annotations
 
@@ -79,22 +82,59 @@ def norm_location(loc: str | None) -> str:
 
 
 def canonical_url(url: str | None) -> str:
+    """Comparable form of a URL: tracking parameters, ``www.``, ATS host aliases, locale prefixes
+    and ``/apply`` suffixes removed. Path case and non-default ports are kept (audit R9: paths
+    are case-sensitive on many sites, and another port is another service)."""
     if not url:
         return ""
     try:
         p = urlsplit(url.strip())
+        port = p.port
     except ValueError:
         return url.strip()
     host = (p.hostname or "").lower()
     host = host.removeprefix("www.")
     host = _HOST_ALIASES.get(host, host)
+    if port and port not in (80, 443):
+        host = f"{host}:{port}"
     path = re.sub(r"/+", "/", p.path).rstrip("/")
     path = re.sub(r"/(apply|application|applynow)$", "", path, flags=re.IGNORECASE)
     if "myworkdayjobs.com" in host:
         path = re.sub(r"^/[a-z]{2}-[A-Z]{2}(?=/)", "", path)  # locale prefix
     query = urlencode(sorted((k, v) for k, v in parse_qsl(p.query, keep_blank_values=False)
                              if not _TRACKING.match(k)))
-    return urlunsplit(("https", host, path.lower() if "workday" not in host else path, query, ""))
+    return urlunsplit(("https", host, path, query, ""))
+
+
+# Query keys that identify one posting; without one of these (or an id-like path segment) a URL
+# is a generic careers/search page and says nothing about which opening a row is.
+_JOB_QUERY_KEYS = re.compile(r"^(jk|vjk|id|jobid|job_id|jid|gh_jid|reqid|req_id|requisitionid|req|job|"
+                             r"jobreq|posting|postingid|opening|pid|currentjobid)$", re.IGNORECASE)
+
+
+def is_generic_url(url: str | None) -> bool:
+    """True for URLs that do not identify a single posting (careers home, search pages)."""
+    if not url:
+        return True
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return True
+    if any(_JOB_QUERY_KEYS.match(k) and v for k, v in parse_qsl(p.query)):
+        return False
+    for seg in (s for s in p.path.split("/") if s):
+        if re.search(r"\d", seg) or (len(seg) >= 25 and seg.count("-") >= 2):
+            return False
+    return True
+
+
+def _url_identities(job: dict) -> set[str]:
+    """Job-specific URLs of a row, posting and application URLs alike (cross-field aliases)."""
+    out = set()
+    for u in (job.get("application_url"), job.get("url")):
+        if u and not is_generic_url(u):
+            out.add(canonical_url(u))
+    return out
 
 
 def requisition_id(job: dict) -> str | None:
@@ -142,18 +182,28 @@ def dedupe_key(job: dict) -> str:
 
 
 def same_opening(a: dict, b: dict) -> str | None:
-    """Reason string if ``a`` and ``b`` are the same opening, else None."""
-    ca, cb = canonical_url(a.get("application_url")), canonical_url(b.get("application_url"))
-    if ca and ca == cb:
-        return "same application URL"
-    if canonical_url(a.get("url")) == canonical_url(b.get("url")):
-        return "same posting URL"
+    """Reason string if ``a`` and ``b`` are the same opening, else None.
+
+    Positive requisition identity wins (audit R9): two known, different requisition IDs are two
+    openings even if both rows share a URL (e.g. a generic careers page). URL equality counts
+    only for job-specific URLs, and a row's posting URL may match another row's application URL."""
+    ra, rb = requisition_id(a), requisition_id(b)
+    if ra and rb and ra != rb:
+        return None
+    shared = _url_identities(a) & _url_identities(b)
+    if shared:
+        ca, cb = canonical_url(a.get("application_url")), canonical_url(b.get("application_url"))
+        if ca and ca == cb and ca in shared:
+            return "same application URL"
+        cu = canonical_url(a.get("url"))
+        if cu and cu == canonical_url(b.get("url")) and cu in shared:
+            return "same posting URL"
+        return "same posting/application URL"
     comp_a, comp_b = company_of(a), company_of(b)
     if not comp_a or comp_a != comp_b:
         return None
-    ra, rb = requisition_id(a), requisition_id(b)
     if ra and rb:
-        return "same employer and requisition ID" if ra == rb else None
+        return "same employer and requisition ID"
     # Similar-text matching is a *cross-source* rule: one source listing the same title twice with
     # different URLs usually means several openings (real data: one employer's Workday site had
     # identical titles with different requisitions and cities).
@@ -175,39 +225,95 @@ def same_opening(a: dict, b: dict) -> str | None:
     return None
 
 
+def _is_board(url: str | None) -> bool:
+    host = (urlsplit(url or "").hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _BOARD_HOSTS)
+
+
 def _rank(job: dict) -> tuple:
-    host = (urlsplit(job.get("application_url") or job.get("url") or "").hostname or "").lower()
-    official = not any(host == h or host.endswith("." + h) for h in _BOARD_HOSTS)
+    """Canonical row: one with application history, then the employer's own posting, then an
+    official application URL, then the earliest seen (official employer postings win over copies)."""
     claimed = job.get("apply_status") in ("applied", "in_progress", "needs_review", "manual")
-    return (0 if claimed else 1, 0 if official else 1, job.get("first_seen_at") or job.get("discovered_at") or "",
-            job.get("url"))
+    own_official = bool(job.get("url")) and not _is_board(job.get("url"))
+    app_official = not _is_board(job.get("application_url") or job.get("url"))
+    return (0 if claimed else 1, 0 if own_official else 1, 0 if app_official else 1,
+            job.get("first_seen_at") or job.get("discovered_at") or "", job.get("url"))
 
 
 _COLS = ("url, title, company, site, strategy, location, job_type, application_url, full_description, description,"
          " requisition_id, apply_status, first_seen_at, discovered_at, duplicate_of")
 
 
+SIMILARITY_BUCKET_MAX = 400  # pairwise text comparison per company bucket (exact identities are unbounded)
+_HISTORY = ("applied", "in_progress", "needs_review", "manual")
+
+
 def run_dedupe(conn: sqlite3.Connection | None = None) -> dict:
-    """Group duplicates and record ``dedupe_key`` / ``duplicate_of``. Idempotent."""
+    """Group duplicates and record ``dedupe_key`` / ``duplicate_of``. Idempotent.
+
+    Audit R9: exact identities (job-specific URLs across posting/application fields, and
+    employer + requisition) are indexed without a size cutoff; only the pairwise text rule is
+    bounded, and skipped comparisons are reported. A merge that would put two different
+    requisitions of one employer into a group is refused and flagged for review. A row linked to
+    a group with application history keeps that link even if its evidence changed, so regrouping
+    can never make an applied opening claimable again."""
     conn = conn or get_connection()
     rows = [dict(r) for r in conn.execute(f"SELECT {_COLS} FROM jobs").fetchall()]
-    # Blocking: compare only rows sharing an application URL, a posting URL or a company.
-    buckets: dict[str, list[int]] = {}
-    for i, j in enumerate(rows):
-        for key in (("a:" + canonical_url(j.get("application_url"))) if j.get("application_url") else "",
-                    "u:" + canonical_url(j.get("url")), ("c:" + company_of(j)) if company_of(j) else ""):
-            if key:
-                buckets.setdefault(key, []).append(i)
+    index = {j["url"]: i for i, j in enumerate(rows)}
     parent = list(range(len(rows)))
     reason: dict[int, str] = {}
+    reqs: dict[int, set[str]] = {i: ({f"{company_of(j)}|{requisition_id(j)}"} if requisition_id(j) else set())
+                                 for i, j in enumerate(rows)}
+    review: dict[int, str] = {}
 
     def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-    for members in buckets.values():
-        if len(members) < 2 or len(members) > 400:
+
+    def conflict(ra: int, rb: int) -> bool:
+        by_company: dict[str, set[str]] = {}
+        for key in reqs[ra] | reqs[rb]:
+            comp, _, req = key.partition("|")
+            by_company.setdefault(comp, set()).add(req)
+        return any(len(v) > 1 for v in by_company.values())
+
+    def union(a: int, b: int, why: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if conflict(ra, rb):
+            # The group would contain two different requisitions of one employer: not merged.
+            review[a] = review[b] = f"possible duplicate (review): {why}, but requisition IDs differ"
+            return
+        parent[rb] = ra
+        reqs[ra] |= reqs.pop(rb)
+        reason[b] = reason.get(b) or why
+        reason[a] = reason.get(a) or why
+
+    # 1. Exact identities: index once, compare each bucket against its first member (no cutoff).
+    exact: dict[str, list[int]] = {}
+    for i, j in enumerate(rows):
+        for u in _url_identities(j):
+            exact.setdefault("x:" + u, []).append(i)
+        rid = requisition_id(j)
+        if rid and company_of(j):
+            exact.setdefault(f"r:{company_of(j)}|{rid}", []).append(i)
+    for members in exact.values():
+        for b in members[1:]:
+            why = same_opening(rows[members[0]], rows[b])
+            if why:
+                union(members[0], b, why)
+    # 2. Similar text (cross-source, same employer/title/location), bounded per company bucket.
+    by_company: dict[str, list[int]] = {}
+    for i, j in enumerate(rows):
+        if company_of(j):
+            by_company.setdefault(company_of(j), []).append(i)
+    unchecked = 0
+    for members in by_company.values():
+        if len(members) > SIMILARITY_BUCKET_MAX:
+            unchecked += len(members)
             continue
         for ai in range(len(members)):
             for bi in range(ai + 1, len(members)):
@@ -216,25 +322,37 @@ def run_dedupe(conn: sqlite3.Connection | None = None) -> dict:
                     continue
                 why = same_opening(rows[a], rows[b])
                 if why:
-                    parent[find(b)] = find(a)
-                    reason[b] = reason.get(b) or why
-                    reason[a] = reason.get(a) or why
+                    union(a, b, why)
+    if unchecked:
+        log.warning("dedupe: %d rows in very large employer buckets were not text-compared", unchecked)
+
     groups: dict[int, list[int]] = {}
     for i in range(len(rows)):
         groups.setdefault(find(i), []).append(i)
-    dup = 0
+    dup = kept = 0
     for members in groups.values():
         canonical = min(members, key=lambda i: _rank(rows[i]))
         for i in members:
             j = rows[i]
             of = None if i == canonical else rows[canonical]["url"]
             why = None if of is None else reason.get(i, "duplicate group")
+            prev = j.get("duplicate_of")
+            if of is None and prev and prev in index and prev != j["url"]:
+                old_root = rows[index[prev]]
+                old_group = [r for r in rows if r.get("duplicate_of") == prev or r["url"] == prev]
+                if any(r.get("apply_status") in _HISTORY for r in old_group) or old_root.get("apply_status") in _HISTORY:
+                    of, why = prev, "kept: earlier group has application history"
+                    kept += 1
+            if of is None and i in review:
+                why = review[i]
             dup += of is not None
             conn.execute("UPDATE jobs SET dedupe_key = ?, duplicate_of = ?, duplicate_reason = ? WHERE url = ?",
                          (dedupe_key(j), of, why, j["url"]))
     conn.commit()
-    log.info("dedupe: %d rows, %d duplicates", len(rows), dup)
-    return {"status": "ok", "rows": len(rows), "duplicates": dup}
+    log.info("dedupe: %d rows, %d duplicates (%d kept for history, %d flagged for review)", len(rows), dup, kept,
+             len(review))
+    return {"status": "ok", "rows": len(rows), "duplicates": dup, "review": len(review), "unchecked": unchecked}
+
 
 
 def group_urls(conn: sqlite3.Connection, url: str) -> list[str]:

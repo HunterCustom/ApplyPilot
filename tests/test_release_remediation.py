@@ -1208,5 +1208,92 @@ class StartupFailureCleanupTests(unittest.TestCase):
         self.assertNotIn(44, chrome._chrome_procs)
 
 
+
+# --- R9: dedupe --------------------------------------------------------------------------------------------
+
+from applypilot import dedupe
+
+
+class DedupeRemediationTests(TempEnv):
+    def put(self, url, **cols):
+        self.add(url, **{"site": "employer", "strategy": "workday_api", **cols})
+
+    def test_distinct_requisitions_on_a_generic_careers_url_stay_apart(self):
+        """Audit reproduction: two requisitions sharing a generic careers URL were declared duplicates."""
+        careers = "https://careers.synthbank.test/careers"
+        self.put("https://www.indeed.com/viewjob?jk=aaa111", application_url=careers, requisition_id="R-1001", strategy="jobspy",
+                 site="indeed")
+        self.put("https://www.indeed.com/viewjob?jk=bbb222", application_url=careers, requisition_id="R-2002", strategy="jobspy",
+                 site="indeed")
+        dedupe.run_dedupe(self.conn)
+        self.assertIsNone(self.row("https://www.indeed.com/viewjob?jk=aaa111")["duplicate_of"])
+        self.assertIsNone(self.row("https://www.indeed.com/viewjob?jk=bbb222")["duplicate_of"])
+
+    def test_generic_url_alone_is_not_evidence(self):
+        careers = "https://careers.synthbank.test/careers"
+        self.put("https://www.indeed.com/viewjob?jk=aaa111", application_url=careers, title="Help Desk Analyst", strategy="jobspy",
+                 site="indeed")
+        self.put("https://www.indeed.com/viewjob?jk=bbb222", application_url=careers, title="Network Engineer", strategy="jobspy",
+                 site="indeed")
+        dedupe.run_dedupe(self.conn)
+        self.assertIsNone(self.row("https://www.indeed.com/viewjob?jk=bbb222")["duplicate_of"])
+        self.assertTrue(dedupe.is_generic_url(careers))
+        self.assertFalse(dedupe.is_generic_url("https://www.indeed.com/viewjob?jk=abc123"))
+        self.assertFalse(dedupe.is_generic_url("https://x.wd5.myworkdayjobs.com/External/job/Raleigh/IT_R0012345"))
+
+    def test_posting_url_matches_another_rows_application_url(self):
+        job = "https://careers.synthbank.test/jobs/77123"
+        self.put(job)
+        self.put("https://www.indeed.com/viewjob?jk=9a1b2c", application_url=job + "?utm_source=board", strategy="jobspy",
+                 site="indeed")
+        dedupe.run_dedupe(self.conn)
+        self.assertEqual(self.row("https://www.indeed.com/viewjob?jk=9a1b2c")["duplicate_of"], job)
+
+    def test_path_case_and_ports_are_significant(self):
+        self.assertNotEqual(dedupe.canonical_url("https://x.test/jobs/AbC123"), dedupe.canonical_url("https://x.test/jobs/abc123"))
+        self.assertNotEqual(dedupe.canonical_url("https://x.test:8443/jobs/1"), dedupe.canonical_url("https://x.test/jobs/1"))
+        self.assertEqual(dedupe.canonical_url("https://www.X.test/jobs/1/apply?utm_source=a"),
+                         dedupe.canonical_url("https://x.test/jobs/1"))
+
+    def test_exact_identities_have_no_bucket_cutoff(self):
+        for i in range(dedupe.SIMILARITY_BUCKET_MAX + 50):
+            self.put(f"https://careers.synthbank.test/jobs/{100000 + i}", title=f"Role {i}")
+        self.put("https://www.indeed.com/viewjob?jk=7e7e7e", application_url="https://careers.synthbank.test/jobs/100007",
+                 strategy="jobspy", site="indeed")
+        out = dedupe.run_dedupe(self.conn)
+        self.assertEqual(self.row("https://www.indeed.com/viewjob?jk=7e7e7e")["duplicate_of"],
+                         "https://careers.synthbank.test/jobs/100007")
+        self.assertGreater(out["unchecked"], 0)  # only the text rule is bounded, and that is reported
+
+    def test_transitive_merge_of_conflicting_requisitions_is_refused_and_flagged(self):
+        # job-specific slugs without numbers, so the middle row carries no requisition of its own
+        x = "https://careers.synthbank.test/jobs/it-support-specialist-raleigh-office"
+        y = "https://careers.synthbank.test/jobs/it-support-specialist-durham-office"
+        self.put("https://www.indeed.com/viewjob?jk=aaa111", application_url=x, requisition_id="R-1", strategy="jobspy", site="indeed")
+        self.put(x, application_url=y)                     # links a (via x) and c (via y) transitively
+        self.put("https://www.linkedin.com/jobs/view/333444", application_url=y, requisition_id="R-2", strategy="jobspy", site="linkedin")
+        out = dedupe.run_dedupe(self.conn)
+        groups = {self.row(u)["duplicate_of"] or u for u in ("https://www.indeed.com/viewjob?jk=aaa111", x, "https://www.linkedin.com/jobs/view/333444")}
+        self.assertGreater(len(groups), 1)  # R-1 and R-2 never end up in one group
+        self.assertGreaterEqual(out["review"], 1)
+        flagged = [self.row(u)["duplicate_reason"] or "" for u in ("https://www.indeed.com/viewjob?jk=aaa111", x, "https://www.linkedin.com/jobs/view/333444")]
+        self.assertTrue(any("review" in f for f in flagged), flagged)
+
+    def test_group_with_application_history_is_kept_under_regrouping(self):
+        job = "https://careers.synthbank.test/jobs/77123"
+        self.put(job, apply_status="applied", applied_at="2026-11-01T00:00:00+00:00")
+        self.put("https://www.indeed.com/viewjob?jk=9a1b2c", application_url=job, strategy="jobspy", site="indeed")
+        dedupe.run_dedupe(self.conn)
+        self.assertEqual(self.row("https://www.indeed.com/viewjob?jk=9a1b2c")["duplicate_of"], job)
+        # The board row's evidence changes (e.g. the board re-points its link); the link stays.
+        self.conn.execute("UPDATE jobs SET application_url = 'https://www.indeed.com/applystart?jk=other1',"
+                          " title = 'Facilities Coordinator', full_description = 'other text' WHERE url = ?",
+                          ("https://www.indeed.com/viewjob?jk=9a1b2c",))
+        dedupe.run_dedupe(self.conn)
+        r = self.row("https://www.indeed.com/viewjob?jk=9a1b2c")
+        self.assertEqual(r["duplicate_of"], job)
+        self.assertIn("application history", r["duplicate_reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
